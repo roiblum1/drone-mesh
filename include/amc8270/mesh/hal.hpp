@@ -24,7 +24,7 @@ class IClock {
   IClock& operator=(IClock&&) = default;
 };
 
-// Inter-drone mesh transceiver (UDP multicast over the GbE mesh radio).
+// Mesh Network Transceiver: the inter-drone radio (UDP multicast over GbE, interface I1).
 class IMeshTransceiver {
  public:
   virtual ~IMeshTransceiver() = default;

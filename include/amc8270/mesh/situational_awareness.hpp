@@ -1,5 +1,5 @@
 // Shared situational-awareness table: pack membership, fused events,
-// verification slots and the learned-benign signature list. Every drone
+// verification slots and the common learning of the situation (benign signatures). Every drone
 // holds one; anti-entropy re-broadcast makes the copies converge.
 #pragma once
 

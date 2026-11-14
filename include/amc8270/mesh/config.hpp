@@ -16,7 +16,7 @@ inline constexpr std::size_t kMaxAliases = 32;
 inline constexpr std::size_t kMaxPacketBytes = 160;
 inline constexpr std::size_t kMaxRxPerTick = 32;
 
-inline constexpr float kNominalEnduranceS = 7.0f * 3600.0f;  // 7 h combustion endurance
+inline constexpr float kNominalEnduranceS = 7.0f * 3600.0f;  // 7-hour combustion EMU nominal endurance
 
 // Capacity relationships the code relies on.
 static_assert(kMaxEvents <= 256, "event order arrays index events with std::uint8_t");

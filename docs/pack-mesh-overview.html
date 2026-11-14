@@ -217,10 +217,10 @@ footer { margin-top: 56px; padding-top: 16px; border-top: 1px solid var(--line);
 
   <section id="idea">
     <h2>Baseline versus mesh</h2>
-    <p class="intro">The GMCS can route the whole pack but can actively control one drone in mission mode. The other drones carry sensors and a mission computer and use neither. With the mesh, those drones scan, share and nominate verifiers on their own. The operator keeps full control of the one drone they fly.</p>
+    <p class="intro">The GMCS can route the whole pack but can actively control one drone in mission mode. The other drones carry sensors and a mission computer and use neither: the single-drone GMCS bottleneck. The mesh exploits the drones while they're under pack routing. They scan, share and nominate verifiers on their own. The operator keeps full control of the one drone they fly.</p>
     <div class="tablewrap">
       <table class="compare">
-        <thead><tr><th>Aspect</th><th>Baseline: one drone at a time</th><th>Mesh-enabled pack</th></tr></thead>
+        <thead><tr><th>Aspect</th><th>Baseline: single-drone GMCS bottleneck</th><th>Mesh-enabled pack</th></tr></thead>
         <tbody>
           <tr><td class="k">Sensor suites contributing</td><td>1 of 6</td><td>All 6 share readings; 5 of 6 can also be tasked. The controlled drone never is.</td></tr>
           <tr><td class="k">Where detections come from</td><td>Wherever the controlled drone happens to be</td><td>Anywhere along a front tens of kilometres wide</td></tr>
@@ -229,15 +229,15 @@ footer { margin-top: 56px; padding-top: 16px; border-top: 1px solid var(--line);
           <tr><td class="k">Operator workload</td><td>Detect, decide, re-task, interpret, report</td><td>One advisory, one verified alert, optional dismissal. In the scenario, zero actions to reach PRIORITY.</td></tr>
           <tr><td class="k">What reaches the GMCS</td><td>Raw data from one drone</td><td>Fused, de-duplicated alerts</td></tr>
           <tr><td class="k">Loss of a drone</td><td>Operator notices and re-plans</td><td>Peer times out after 5 s and its task is re-assigned (4.6 s in the scenario)</td></tr>
-          <tr><td class="k">Dependence on the C2 link</td><td>Total</td><td>Only alerts need a link, and any drone with a link can send them</td></tr>
+          <tr><td class="k">Pack independence</td><td>None: every decision waits for the operator</td><td>No leader and no C2 link needed to decide. Only alerts need a link, and any drone with a link can send them</td></tr>
         </tbody>
       </table>
     </div>
     <div class="caps">
       <div><h3>Wide-area scanning</h3><p>Every drone keeps its direction-finder and imagers running on the route and files each reading with the pack.</p></div>
       <div><h3>Cooperative triangulation</h3><p>Bearings from several drones intersect by weighted least squares. Near-parallel geometry is rejected.</p></div>
-      <div><h3>Autonomous prioritisation</h3><p>Every event gets an urgency from class, novelty, confidence and freshness. All drones compute the same ranking.</p></div>
-      <div><h3>Shared learning</h3><p>An operator dismissal of a benign emitter reaches every drone, and the drone checking it is released.</p></div>
+      <div><h3>Mission task prioritisation</h3><p>Every event gets an urgency from class, novelty, confidence and freshness. All drones compute the same ranking.</p></div>
+      <div><h3>Common learning of the situation</h3><p>One shared table of benign signatures. An operator dismissal reaches every drone, and the drone checking it is released.</p></div>
       <div><h3>Verification and alerting</h3><p>The best-placed drones approach from different angles. Two sensor types must agree before a PRIORITY alert.</p></div>
     </div>
   </section>
@@ -364,11 +364,11 @@ footer { margin-top: 56px; padding-top: 16px; border-top: 1px solid var(--line);
     GEO["GEO SATCOM terminal"]
   end
 
-  MESH["Inter-drone mesh transceiver&lt;br/&gt;MANET radio + antennas"]
+  MESH["Mesh Network Transceiver&lt;br/&gt;MANET radio + antennas"]
 
   AMC["&lt;b&gt;Airborne Mission Computer&lt;br/&gt;Model 8270&lt;/b&gt;&lt;br/&gt;- Mission GbE switch, VLANs&lt;br/&gt;- PackMeshManager + SA table&lt;br/&gt;- evaluateAndCoordinateAlerts&lt;br/&gt;- C2 link manager: LOS, LEO, GEO&lt;br/&gt;- Guidance request gateway&lt;br/&gt;- Time service: PPS and UTC"]
 
-  subgraph SENS["Modular homing and detection sensors"]
+  subgraph SENS["Variable Homing Devices bus: modular homing and detection devices"]
     DF["RF direction-finder"]
     EOIR["EO / IR gimbal"]
     ANOM["Anomaly detector modules"]
@@ -378,7 +378,7 @@ footer { margin-top: 56px; padding-top: 16px; border-top: 1px solid var(--line);
   subgraph FLT["Flight and propulsion"]
     FCS["Flight Control System&lt;br/&gt;FCS"]
     NAV["INS / GNSS"]
-    EMU["Engine Management Unit&lt;br/&gt;combustion engine"]
+    EMU["7-hour combustion EMU&lt;br/&gt;Engine Management Unit"]
   end
 
   GMCS -. "LOS RF" .- LOS
@@ -394,10 +394,10 @@ footer { margin-top: 56px; padding-top: 16px; border-top: 1px solid var(--line);
   MESH &lt;--&gt;|"I1 GbE UDP multicast"| AMC
   AMC --&gt;|"I2 1 PPS"| MESH
 
-  DF &lt;--&gt;|"I7 GbE"| AMC
-  EOIR &lt;--&gt;|"I8 GbE + RS-422"| AMC
-  ANOM &lt;--&gt;|"I9 CAN or RS-485"| AMC
-  PPU &lt;--&gt;|"I10 CAN"| AMC
+  DF &lt;--&gt;|"I7 VHD bus, GbE"| AMC
+  EOIR &lt;--&gt;|"I8 VHD bus, GbE + RS-422"| AMC
+  ANOM &lt;--&gt;|"I9 VHD bus, CAN or RS-485"| AMC
+  PPU &lt;--&gt;|"I10 VHD bus, CAN"| AMC
 
   AMC &lt;--&gt;|"I11 dual RS-422"| FCS
   NAV --&gt;|"I12 RS-422"| FCS
@@ -426,8 +426,8 @@ footer { margin-top: 56px; padding-top: 16px; border-top: 1px solid var(--line);
                           +--------------------------------------------------------+          +--------------+
                           |         AIRBORNE MISSION COMPUTER  MODEL 8270          |          |    FLIGHT    |
 +--------------+          | +--------------------+      +------------------------+ |          |   CONTROL    |
-| INTER-DRONE  |          | | MISSION GbE SWITCH |      |    PackMeshManager     | |          | SYSTEM (FCS) |
-|     MESH     |&lt;---I1---&gt;| | VLAN: mesh / C2 /  |&lt;----&gt;|    peer discovery,     | |          |              |
+|     MESH     |          | | MISSION GbE SWITCH |      |    PackMeshManager     | |          | SYSTEM (FCS) |
+|   NETWORK    |&lt;---I1---&gt;| | VLAN: mesh / C2 /  |&lt;----&gt;|    peer discovery,     | |          |              |
 | TRANSCEIVER  |          | |      sensors       |      |  state sync, SA table  | |&lt;--I11---&gt;| enforces the |
 |(MANET radio) |&lt;---I2----| +--------------------+      +------------------------+ |          |corridor; may |
 |              |          |                                         ^              |          |  refuse AMC  |
@@ -440,41 +440,41 @@ footer { margin-top: 56px; padding-top: 16px; border-top: 1px solid var(--line);
 |  other pack  |          |                                         ^              |          | nav solution |
 |    drones    |          |                                         v              |          +--------------+
 +--------------+          | +--------------------+      +------------------------+ |
-                          | |    TIME SERVICE    |      |    GUIDANCE REQUEST    | |
-                          | |    1 PPS + UTC     |      |        GATEWAY         | |          +--------------+
-                          | | stamps all traffic |      |   corridor pre-check   | |          | ENGINE MGMT  |
-                          | +--------------------+      +------------------------+ |&lt;--I15----|  UNIT (EMU)  |
-                          |                                                        |          | I14: CAN-FCS |
-                          | Fixed storage, no heap, bounded loops                  |          +--------------+
-                          |                                                        |
+                          | |    TIME SERVICE    |      |    GUIDANCE REQUEST    | |          +--------------+
+                          | |    1 PPS + UTC     |      |        GATEWAY         | |          |    7-HOUR    |
+                          | | stamps all traffic |      |   corridor pre-check   | |          |  COMBUSTION  |
+                          | +--------------------+      +------------------------+ |&lt;--I15----|     EMU      |
+                          |                                                        |          | (engine mgmt)|
+                          | Fixed storage, no heap, bounded loops                  |          | I14: CAN-FCS |
+                          |                                                        |          +--------------+
                           +--------------------------------------------------------+
                                     ^                 ^                 ^
                                     | I7 GbE: RF-DF   | I8 GbE+RS-422   | I9/I10 CAN/485
                                     v                 v                 v
                           +--------------------------------------------------------+
-                          |           MODULAR HOMING &amp; DETECTION SENSORS           |
+                          |              VARIABLE HOMING DEVICES BUS               |
+                          |          modular homing and detection devices          |
                           |  [RF-DF] [EO/IR gimbal] [Anomaly det.] [Payload pwr]   |
-                          |                                                        |
                           +--------------------------------------------------------+</pre>
     <h3>Interfaces</h3>
     <div class="tablewrap">
       <table>
         <thead><tr><th>ID</th><th>Link</th><th>Bus</th><th>Carries</th></tr></thead>
         <tbody>
-          <tr><td class="id">I1</td><td>Mesh transceiver and AMC</td><td class="bus">Gigabit Ethernet, UDP multicast</td><td>Mesh frames, 160 bytes at most</td></tr>
-          <tr><td class="id">I2</td><td>AMC time service to mesh radio</td><td class="bus">1 PPS, RS-422</td><td>Time pulse for slot timing</td></tr>
+          <tr><td class="id">I1</td><td>Mesh Network Transceiver and AMC</td><td class="bus">Gigabit Ethernet, UDP multicast</td><td>Mesh frames, 160 bytes at most</td></tr>
+          <tr><td class="id">I2</td><td>AMC time service to Mesh Network Transceiver</td><td class="bus">1 PPS, RS-422</td><td>Time pulse for slot timing</td></tr>
           <tr><td class="id">I4</td><td>LOS, LEO, GEO terminals and AMC</td><td class="bus">Gigabit Ethernet</td><td>Alerts, mission data, downlinked imagery</td></tr>
           <tr><td class="id">I5</td><td>C2 terminals to FCS</td><td class="bus">RS-422, dual</td><td><b>Flight commands, direct, not through the AMC</b></td></tr>
           <tr><td class="id">I6</td><td>AMC and C2 terminals</td><td class="bus">RS-422 / RS-485</td><td>Link state, antenna control, active-link selection</td></tr>
-          <tr><td class="id">I7</td><td>RF direction-finder and AMC</td><td class="bus">Gigabit Ethernet</td><td>Bearing reports; IQ on demand</td></tr>
-          <tr><td class="id">I8</td><td>EO/IR gimbal and AMC</td><td class="bus">Gigabit Ethernet, RS-422</td><td>Video, geolocated fixes, cueing</td></tr>
-          <tr><td class="id">I9</td><td>Anomaly detectors and AMC</td><td class="bus">CAN 2.0B or RS-485</td><td>Events, status</td></tr>
-          <tr><td class="id">I10</td><td>Payload power unit and AMC</td><td class="bus">CAN 2.0B</td><td>Power state, faults, on/off commands</td></tr>
+          <tr><td class="id">I7</td><td>Variable Homing Devices bus: RF direction-finder</td><td class="bus">Gigabit Ethernet</td><td>Bearing reports; IQ on demand</td></tr>
+          <tr><td class="id">I8</td><td>Variable Homing Devices bus: EO/IR gimbal</td><td class="bus">Gigabit Ethernet, RS-422</td><td>Video, geolocated fixes, cueing</td></tr>
+          <tr><td class="id">I9</td><td>Variable Homing Devices bus: anomaly detectors</td><td class="bus">CAN 2.0B or RS-485</td><td>Events, status</td></tr>
+          <tr><td class="id">I10</td><td>Variable Homing Devices bus: payload power unit</td><td class="bus">CAN 2.0B</td><td>Power state, faults, on/off commands</td></tr>
           <tr><td class="id">I11</td><td>AMC and FCS</td><td class="bus">RS-422, dual (1553B optional)</td><td>Requests and cancels one way; mode, corridor, accept or refuse, health the other</td></tr>
           <tr><td class="id">I12</td><td>INS/GNSS to AMC and FCS</td><td class="bus">RS-422, 100 to 200 Hz</td><td>Position, velocity, attitude</td></tr>
           <tr><td class="id">I13</td><td>INS/GNSS to AMC time service</td><td class="bus">1 PPS + time of day</td><td>UTC time base</td></tr>
-          <tr><td class="id">I14</td><td>EMU and FCS</td><td class="bus">CAN 2.0B / CANaerospace</td><td>Engine control and status</td></tr>
-          <tr><td class="id">I15</td><td>EMU to AMC</td><td class="bus">CAN 2.0B, listen-only</td><td>Fuel flow and quantity, giving the endurance against the 7 h nominal</td></tr>
+          <tr><td class="id">I14</td><td>7-hour combustion EMU and FCS</td><td class="bus">CAN 2.0B / CANaerospace</td><td>Engine control and status</td></tr>
+          <tr><td class="id">I15</td><td>7-hour combustion EMU to AMC</td><td class="bus">CAN 2.0B, listen-only</td><td>Fuel flow and quantity, giving the endurance against the 7 h nominal</td></tr>
         </tbody>
       </table>
     </div>
@@ -482,7 +482,7 @@ footer { margin-top: 56px; padding-top: 16px; border-top: 1px solid var(--line);
 
   <section id="algorithm">
     <h2>How the pack decides</h2>
-    <p class="intro">No leader. Every drone folds the same readings into the same table and computes the same plan. Drones with the same table agree without negotiating.</p>
+    <p class="intro">Pack independence: no leader. Every drone folds the same readings into the same table and computes the same plan. Drones with the same table agree without negotiating.</p>
     <ol class="steps">
       <li><span><b>Share.</b> Each drone broadcasts a heartbeat at 1 Hz (position, fuel, active sensor, mode, task) and each sensor reading as it happens. Own readings are re-sent every 2 s so a lost packet only delays convergence.</span></li>
       <li><span><b>Fuse.</b> Readings are keyed by observer and sensor and kept in sorted order. Bearings intersect into a position; duplicate events merge into the lowest id.</span></li>
@@ -561,13 +561,13 @@ PRIORITY:  confidence >= 0.9, CEP <= 250 m,
 struct DroneState {
   DroneId id = kNoDrone;
   DroneMode mode = DroneMode::PACK_ROUTING;
-  SensorType active_sensor = SensorType::NONE;  // homing sensor currently cued
+  SensorType active_sensor = SensorType::NONE;  // Variable Homing Devices bus device currently cued
   SensorMask installed_sensors = 0;
   LinkMask available_links = 0;  // GMCS links currently up (LOS/LEO/GEO)
   GeoPoint position{};
   float speed_mps = 0.0f;
   float heading_deg = 0.0f;
-  float endurance_remaining_s = 0.0f;  // fuel-derived, out of kNominalEnduranceS
+  float endurance_remaining_s = 0.0f;  // from the 7-hour combustion EMU's fuel data, out of kNominalEnduranceS
   float bingo_endurance_s = 0.0f;      // reserve needed to reach recovery
   EventId tasked_event = kNoEvent;     // event being verified, if any
   TimeMs timestamp_ms = 0;

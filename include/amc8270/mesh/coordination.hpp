@@ -1,6 +1,6 @@
-// Distributed prioritisation and verifier selection. Everything here is a
-// deterministic function of (table, pack snapshot, time), so every drone that
-// holds the same table computes the same plan without a leader.
+// Mission task prioritisation and verifier selection, with pack independence:
+// everything here is a deterministic function of (table, pack snapshot, time),
+// so every drone that holds the same table computes the same plan without a leader.
 #pragma once
 
 #include <cstddef>

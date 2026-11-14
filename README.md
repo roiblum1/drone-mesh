@@ -4,7 +4,7 @@
 
 A peer-to-peer airborne mesh that lets a pack of 150 kg combustion UAVs share sensor readings, build one picture of the world, and decide on their own which drones should verify a detection, while the GMCS keeps full control of the one drone it is flying.
 
-The GMCS can route the whole pack but can actively control only one drone in mission mode. The other drones fly the route with their sensors and processors idle. This repo makes them useful.
+The GMCS can route the whole pack but can actively control only one drone in mission mode. The other drones fly the route with their sensors and processors idle. That is the single-drone GMCS bottleneck. This repo removes it by exploiting drones while they're under pack routing: they scan, triangulate, share a common learning of the situation and decide among themselves which of them should verify a detection.
 
 | Deliverable | Where |
 |---|---|
@@ -43,20 +43,20 @@ CMake works too: `cmake -S . -B build-cmake && cmake --build build-cmake && ctes
 | File | Role |
 |---|---|
 | `types.hpp`, `config.hpp` | Ids, enums, capacities (`kMaxPackSize = 16`, `kMaxEvents = 64`, ...) and the tunable `MeshConfig` |
-| `drone_state.hpp` | `DroneState`: position, remaining endurance (of 7 h), active homing sensor, mode `PACK_ROUTING` / `ACTIVE_MISSION` (plus `VERIFYING`, `RTB`) |
+| `drone_state.hpp` | `DroneState`: position, remaining endurance (of the 7-hour combustion EMU's nominal), active device on the Variable Homing Devices bus, mode `PACK_ROUTING` / `ACTIVE_MISSION` (plus `VERIFYING`, `RTB`) |
 | `detected_event.hpp` | `SensorObservation`, `DetectedEvent`, `VerificationTask` |
 | `mesh_packet.hpp/.cpp` | `MeshPacket` and its wire format: little-endian, CRC-32, strict validation on decode |
 | `geo.hpp/.cpp` | Distance and bearing, local east/north frame, bearing-only triangulation |
-| `situational_awareness.hpp/.cpp` | `SituationalAwarenessTable`: peers, fused events, verifier slots, learned-benign signatures |
-| `coordination.hpp/.cpp` | Urgency, suitability, verifier selection, alert levels and alert-owner ranking (pure functions) |
+| `situational_awareness.hpp/.cpp` | `SituationalAwarenessTable`: peers, fused events, verifier slots, and the common learning of the situation (benign signatures) |
+| `coordination.hpp/.cpp` | Mission task prioritisation: urgency, suitability, verifier selection, alert levels and alert-owner ranking (pure functions) |
 | `pack_mesh_manager.hpp/.cpp` | `PackMeshManager`: discovery, state sync, `evaluateAndCoordinateAlerts()` |
-| `hal.hpp` | Interfaces to the radio, clock, C2 link and FCS, so the logic runs on any RTOS, a host, or the simulator |
+| `hal.hpp` | Interfaces to the Mesh Network Transceiver, clock, C2 link and FCS, so the logic runs on any RTOS, a host, or the simulator |
 
-### How a pack decides, with no leader
+### Pack independence: how a pack decides with no leader
 
 1. Each drone broadcasts a heartbeat (1 Hz) with its position, fuel, active sensor and mode, and each sensor reading as it happens.
 2. Every drone folds the same readings into the same table. Readings are keyed by (observer, sensor) and kept in sorted order, so tables converge. Own readings are re-sent every 2 s, so a lost packet only delays convergence.
-3. `evaluateAndCoordinateAlerts()` runs every 0.5 s on every drone: fuse bearings into positions, merge duplicate events, rank by urgency, and compute the verifier plan. The plan is a deterministic function of the table, so drones with the same table agree without negotiating.
+3. `evaluateAndCoordinateAlerts()` runs every 0.5 s on every drone: fuse bearings into positions, merge duplicate events, rank by urgency (mission task prioritisation), and compute the verifier plan. The plan is a deterministic function of the table, so drones with the same table agree without negotiating.
 4. A drone that finds itself in the plan sends a request to the FCS (standoff point, approach bearing, sensor to cue) and claims its slot on the mesh. Claims are arbitrated by score (quantised, so every drone ends with the same holder whatever the arrival order), ties by lowest id. A drone that loses arbitration is not ordered off its task; it gives way at the next plan, because the winner now holds the incumbent bonus.
 5. Alerts to the GMCS: ADVISORY once an event is localised well enough, PRIORITY once two sensor types agree. One drone is the owner, with ranked backups; the GMCS also de-duplicates by event id.
 

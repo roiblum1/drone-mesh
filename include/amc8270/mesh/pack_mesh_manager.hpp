@@ -45,11 +45,11 @@ class PackMeshManager {
   ~PackMeshManager() = default;
 
   // ---- inputs from the rest of the avionics ----------------------------
-  // Own state from FCS / INS-GNSS / EMU / C2 link manager. `mode` is the
+  // Own state from FCS / INS-GNSS / 7-hour combustion EMU / C2 link manager. `mode` is the
   // GMCS-commanded mode (PACK_ROUTING, ACTIVE_MISSION or RTB); the manager
   // reports VERIFYING itself while it holds a task.
   void updateOwnState(const DroneState& state) noexcept;
-  // A reading from the homing/detection sensor bus. Fills observer, position
+  // A reading from a device on the Variable Homing Devices bus. Fills observer, position
   // and event association; broadcasts it to the pack. False if dropped.
   [[nodiscard]] bool reportLocalDetection(SensorObservation obs) noexcept;
   // Operator declared a signature benign: learned locally and shared.

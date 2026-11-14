@@ -2,7 +2,7 @@
 
 ## Summary
 
-Today the GMCS can steer the whole pack along a route but can actively fly only **one** drone in mission mode. The other drones carry sensors and a mission computer and use neither. With the airborne mesh, every Model 8270 shares what its sensors see, builds the same picture as its neighbours, and decides **without a leader** which drones should leave the route to verify a detection. The operator receives a short alert instead of a raw stream, and keeps full control of the one drone they are flying.
+Today the GMCS can steer the whole pack along a route but can actively fly only **one** drone in mission mode. The other drones carry sensors and a mission computer and use neither. This is the **single-drone GMCS bottleneck**, and the mesh removes it by **exploiting drones while they're under pack routing**. With the airborne mesh, every Model 8270 shares what its sensors see, builds the same picture as its neighbours, and decides **without a leader** which drones should leave the route to verify a detection. The operator receives a short alert instead of a raw stream, and keeps full control of the one drone they are flying.
 
 Every number below is labelled **[simulated]** (output of this repo's 6-drone scenario, `make sim`), **[computed]** (derived from the code's constants) or **[estimate]** (engineering judgement, to be replaced by flight data). None is a flight-test result.
 
@@ -10,7 +10,7 @@ Every number below is labelled **[simulated]** (output of this repo's 6-drone sc
 
 ## 1. Baseline versus mesh-enabled operations
 
-| Aspect | Baseline: single-drone bottleneck | Mesh-enabled pack |
+| Aspect | Baseline: single-drone GMCS bottleneck | Mesh-enabled pack |
 |---|---|---|
 | Sensor suites contributing | 1 of 6 (the controlled drone) | All 6 can share readings; 5 of 6 can also be tasked (the controlled drone never is) [by design] |
 | Where detections come from | Only where the controlled drone happens to be | Anywhere along a pack front tens of km wide |
@@ -20,13 +20,15 @@ Every number below is labelled **[simulated]** (output of this repo's 6-drone sc
 | What reaches the GMCS | Raw sensor data from one drone | Fused, de-duplicated alerts: one ADVISORY, then one PRIORITY, per event |
 | C2 load | Video / IQ streams over SATCOM | Alerts only (tens to ~100 bytes each; format is out of this repo's scope) [estimate] |
 | Mesh load | none | 1.7 kbit/s mean, 3.7 kbit/s peak transmitted per drone [simulated, includes headers and CRC] |
-| False-alarm control | Operator judgement, per event | Multi-sensor confirmation required for PRIORITY; learned-benign signatures shared pack-wide |
+| False-alarm control | Operator judgement, per event | Multi-sensor confirmation required for PRIORITY; common learning of the situation spreads each benign signature pack-wide |
 | Loss of a drone | Operator notices, re-plans | Peer times out after 5 s of silence and its task is re-assigned [simulated: 4.6 s after the loss] |
-| Dependence on the C2 link | Total | Detection, fusion and nomination run on board; only alerts need a link, and any drone with a link can send them |
+| Pack independence | None: every decision waits for the operator and the C2 link | Detection, fusion, mission task prioritisation and nomination run on board with no leader; only alerts need a link, and any drone with a link can send them |
 
 ---
 
-## 2. What the passive drones do
+## 2. Exploiting drones while they're under pack routing
+
+A drone in `PACK_ROUTING` flies the route the GMCS set for the pack. The mesh does not change that route unless the pack decides the drone should verify something, and even then it only asks the FCS. Everything below happens on drones the operator is not flying.
 
 ### 2.1 Continuous wide-area scanning
 
@@ -55,9 +57,9 @@ Result [simulated]: 5 bearings, reported CEP 708 m, actual error 795 m.
 
 So the CEP is calibrated for the typical case (about half of fixes fall inside it, as a CEP should) but poor geometry has heavy tails: a few percent of fixes are more than 3 × CEP off. That is acceptable for an **early-warning advisory**, which only cues a closer look, and is why PRIORITY requires a second sensor type.
 
-### 2.3 Autonomous event prioritisation
+### 2.3 Mission task prioritisation
 
-Every event gets an urgency, computed identically on every drone:
+Mission task prioritisation decides which detections earn a drone's time. Every event gets an urgency, computed identically on every drone:
 
 ```
 urgency = severity(class) × novelty × (0.3 + 0.7 × confidence) × (0.5 + 0.5 × freshness)
@@ -79,7 +81,9 @@ Events are ranked by urgency (ties by event id). Below 0.25 an event is tracked 
 
 Result [simulated]: the beacon ranks 0.90, the novel ISM emitter 0.45, the pre-briefed weather radio 0.09, so only the beacon pulls aircraft off the route first.
 
-### 2.4 Shared environmental learning
+### 2.4 Common learning of the situation
+
+The pack keeps one shared table of what it has learned about the environment: which signatures are benign and which events have already been reported. Every drone holds the same copy, so a lesson learned once applies to all of them.
 
 - **Pre-briefed benign signatures** are loaded on every drone from mission data.
 - **Operator dismissals** are learned and shared: when the operator marks an emitter benign, the drone holding the GMCS link broadcasts a `SIGNATURE_UPDATE`. Every peer marks the signature benign, drops the event, and releases any drone verifying it. Learned signatures are re-broadcast every 2 s so a drone that missed the message, or joined late, catches up.
@@ -115,6 +119,15 @@ Hard limits:
 | PRIORITY (verified) | confidence ≥ 0.9, CEP ≤ 250 m, ≥ 2 observers, ≥ 2 sensor types | t = 328.1 s, CEP 70 m, actual error 28 m, via LOS |
 
 One drone is the alert owner: the primary verifier first, then the secondary, then observers, then any free drone with a link. A lower-ranked drone waits 3 s per rank and cancels if it hears `ALERT_ISSUED`, so the pack sends one alert per event; the GMCS also de-duplicates by event id.
+
+### 2.6 Pack independence
+
+Pack independence means the pack keeps doing all of the above with no leader and with no help from the GMCS:
+
+- **No leader.** Every drone runs the same `evaluateAndCoordinateAlerts()` on the same table and reaches the same plan. No drone is special, so no single loss stops the pack.
+- **No C2 link needed to decide.** Detection, fusion, mission task prioritisation and verifier nomination all run on board. Only the alert itself needs a link, and any drone with one can send it.
+- **Losses are absorbed.** A silent drone times out after 5 s and its task moves to another drone.
+- **The operator keeps the one drone they fly.** The mesh reads that drone's sensors but never tasks it.
 
 ---
 

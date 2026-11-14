@@ -34,14 +34,14 @@ A generic 150 kg-class fixed-wing UAV, not any real product:
 
 - **Visual:** Six UAVs in line abreast over open terrain at altitude, about ten kilometres apart (shown tight for the shot). One aircraft has a bright warm-white ring: the operator-controlled drone. The other five are slightly dimmed, with a faint dotted route line ahead of them. Quiet, wide, empty sky.
 - **Headline:** *Today, only one aircraft is on the job.*
-- **Caption:** The operator can actively control one drone. The rest fly the route with their sensors and processors idle.
+- **Caption:** The single-drone GMCS bottleneck: the operator can actively control one drone. The rest fly the route with their sensors and processors idle.
 - **Callout chip:** `1 of 6 sensor suites in use`
 
 ### Panel 2 — "The mesh wakes the pack"
 
 - **Visual:** The same formation. Every aircraft now has a soft teal halo. Thin teal arcs connect neighbours, with small packet dots travelling along them. Each drone shows a faint conical sensor sweep towards the ground. The operator-controlled drone keeps its warm-white ring; it shares its sensor readings but is never re-tasked by the mesh.
 - **Headline:** *Every aircraft listens. Every aircraft shares.*
-- **Caption:** An airborne peer-to-peer mesh, run by the Model 8270 on each drone, turns passive route-flyers into a distributed sensor.
+- **Caption:** An airborne peer-to-peer mesh, run by the Model 8270 on each drone, exploits the drones while they're under pack routing and turns them into one distributed sensor.
 - **Callout chip:** `6 of 6 sensor suites contributing`
 
 ### Panel 3 — "First contact"
@@ -62,7 +62,7 @@ A generic 150 kg-class fixed-wing UAV, not any real product:
 
 - **Visual:** Two aircraft bank away from the formation on different headings, one from the east and one from the north, so the sensor cones hit the source from two angles. The rest of the pack keeps flying line abreast. The operator-controlled aircraft is unaffected. One aircraft in the line carries a small amber fuel icon: it keeps scanning but is not diverted.
 - **Headline:** *The pack decides who goes. The rest keep watching.*
-- **Caption:** Drones are chosen by time-to-target, available sensor type, fuel margin and viewing angle. At most two fifths of the pack ever leave the route.
+- **Caption:** Mission task prioritisation, with no leader: drones are chosen by time-to-target, available sensor type, fuel margin and viewing angle. At most two fifths of the pack ever leave the route.
 - **Callout chip:** `2 verifiers · different angles · 3 keep scanning`
 
 ### Panel 6 — "A verified alert, not a video feed"
@@ -116,11 +116,11 @@ cinematic wide aerial, golden hour, six identical unarmed 150 kg fixed-wing UAVs
 
 | Slide | Title | One line |
 |---|---|---|
-| 1 | One operator. One working sensor. | Today, only the drone the operator controls contributes to the mission. |
-| 2 | The mesh wakes the pack | Peer-to-peer links turn every route-flyer into a distributed sensor. |
+| 1 | One operator. One working sensor. | The single-drone GMCS bottleneck: only the drone the operator controls contributes to the mission. |
+| 2 | The mesh wakes the pack | Exploiting drones while they're under pack routing: every route-flyer becomes part of one distributed sensor. |
 | 3 | One hears it. All of them know. | A first bearing reaches every aircraft in the next mesh cycle. |
 | 4 | Five drones triangulate what one could only hear | Cooperative direction-finding locates a source without anyone leaving formation. |
-| 5 | The pack decides who goes | Best-placed drones verify from different angles; the rest keep scanning. |
+| 5 | The pack decides who goes | Pack independence: the best-placed drones verify from different angles, the rest keep scanning, no leader needed. |
 | 6 | The operator gets an answer, not a stream | One verified alert, over the best available link. |
 
 *Footnote for every slide using the callouts:* "Figures from a 6-drone software simulation of the mesh logic; not flight-test results."
