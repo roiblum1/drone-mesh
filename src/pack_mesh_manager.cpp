@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 
 #include "amc8270/mesh/geo.hpp"
 #include "amc8270/mesh/validation.hpp"
@@ -247,6 +248,14 @@ void PackMeshManager::sendAntiEntropy(TimeMs now) noexcept {
   for (std::size_t i = 0; i < table_.learnedCount(); ++i) {
     (void)broadcast(SignatureUpdatePayload{table_.learnedAt(i)}, now);
   }
+
+  for (std::size_t i = issued_.size(); i-- > 0;) {
+    if (elapsedMs(now, issued_[i].at_ms) > cfg_.alert_notice_repeat_ms) {
+      issued_.erase_at(i);
+      continue;
+    }
+    (void)broadcast(AlertIssuedPayload{table_.resolve(issued_[i].event), issued_[i].level, self_}, now);
+  }
 }
 
 // ----------------------------------------------------------------- tick
@@ -303,6 +312,7 @@ void PackMeshManager::cancelTask(bool notify_guidance) noexcept {
 void PackMeshManager::syncOwnTask(const Assignment* mine, TimeMs now) noexcept {
   if (mine == nullptr) {
     cancelTask(true);
+    pending_event_ = kNoEvent;
     return;
   }
 
@@ -316,26 +326,57 @@ void PackMeshManager::syncOwnTask(const Assignment* mine, TimeMs now) noexcept {
   t.sensor_to_cue = mine->sensor_to_cue;
   t.urgency = mine->urgency;
 
-  bool issue = !task_active_;
-  if (task_active_) {
+  // A new assignment (or a different event or role) is claimed at once but flown
+  // only once it has held for claim_confirm_ms.
+  bool claim_now = false;
+  const auto confirmNew = [&]() {
+    const bool same = pending_event_ != kNoEvent && table_.resolve(pending_event_) == mine->event_id &&
+                      pending_role_ == mine->role;
+    if (!same) {
+      pending_role_ = mine->role;
+      pending_since_ms_ = now;
+      claim_now = true;
+    }
+    pending_event_ = mine->event_id;  // adopt a renamed id
+    return isDue(now, pending_since_ms_, cfg_.claim_confirm_ms);
+  };
+
+  bool issue = false;
+  if (!task_active_) {
+    issue = confirmNew();
+  } else {
     if (table_.resolve(task_.event_id) != mine->event_id || task_.role != mine->role) {
-      issue = true;
+      issue = confirmNew();
     } else {
+      pending_event_ = kNoEvent;
       task_.event_id = mine->event_id;  // adopt a renamed id
-      const double threshold =
-          std::max(cfg_.retask_move_m, cfg_.retask_cep_factor * static_cast<double>(task_.target_cep_m));
-      if (distanceM(task_.target, t.target) > threshold) issue = true;
+      const double cep_then = static_cast<double>(task_.target_cep_m);
+      const double cep_now = static_cast<double>(t.target_cep_m);
+      const double moved = distanceM(task_.target, t.target);
+      const bool beyond_noise = moved > std::max(cfg_.retask_move_m, cfg_.retask_cep_factor * std::hypot(cep_then, cep_now));
+      const bool refined = cep_now <= 0.5 * cep_then && moved > std::max(cfg_.retask_move_m, cfg_.retask_cep_factor * cep_now);
+      // A momentarily lost fix (a provisional point down one bearing) never re-points a verifier
+      // already flying to a real position estimate.
+      const bool lost_fix = cep_now >= cfg_.provisional_cep_m && cep_then < cfg_.provisional_cep_m;
+      if ((beyond_noise || refined) && !lost_fix) {
+        if (retask_pending_since_ms_ == 0) retask_pending_since_ms_ = now;
+        issue = isDue(now, retask_pending_since_ms_, cfg_.retask_confirm_ms);  // only once the move persists
+      } else {
+        retask_pending_since_ms_ = 0;
+      }
     }
   }
 
   if (issue) {
+    retask_pending_since_ms_ = 0;
+    pending_event_ = kNoEvent;
     guidance_.requestVerification(t);
     task_ = t;
     task_active_ = true;
     ++stats_.tasks_issued;
     heartbeat_requested_ = true;
     table_.setSelf(exportedState());
-  } else if (!isDue(now, last_claim_ms_, 2ULL * static_cast<TimeMs>(cfg_.anti_entropy_period_ms))) {
+  } else if (!claim_now && !isDue(now, last_claim_ms_, 2ULL * static_cast<TimeMs>(cfg_.anti_entropy_period_ms))) {
     return;
   }
 
@@ -352,7 +393,7 @@ void PackMeshManager::dispatchAlerts(TimeMs now) noexcept {
 
   for (std::size_t k = 0; k < n; ++k) {
     DetectedEvent& ev = events[order[k]];
-    const AlertLevel level = evaluateAlertLevel(ev, table_.isBenign(ev.signature), cfg_);
+    const AlertLevel level = evaluateAlertLevel(ev, table_.isBenign(ev.signature), cfg_, &table_);
     if (level != AlertLevel::PRIORITY) ev.priority_ready_ms = 0;
     if (level == AlertLevel::NONE) {
       ev.advisory_ready_ms = 0;
@@ -364,9 +405,17 @@ void PackMeshManager::dispatchAlerts(TimeMs now) noexcept {
     TimeMs& ready = level == AlertLevel::PRIORITY ? ev.priority_ready_ms : ev.advisory_ready_ms;
     if (ready == 0) ready = now;
 
+    // A position from bearings alone must hold before it warns anyone; the
+    // backup ranks then count from the end of that hold, as they would otherwise.
+    TimeMs hold = 0;
+    if (level == AlertLevel::ADVISORY) {
+      bool fix = false;
+      for (const auto& o : ev.observations) fix = fix || o.has_fix;
+      if (!fix) hold = cfg_.advisory_bearing_hold_ms;
+    }
     const int rank = alertOwnerRank(table_, ev, self_);
     if (rank < 0) continue;
-    if (elapsedMs(now, ready) < static_cast<TimeMs>(rank) * cfg_.alert_backup_delay_ms) continue;
+    if (elapsedMs(now, ready) < hold + static_cast<TimeMs>(rank) * cfg_.alert_backup_delay_ms) continue;
 
     GmcsAlert alert;
     alert.event_id = ev.id;
@@ -386,7 +435,9 @@ void PackMeshManager::dispatchAlerts(TimeMs now) noexcept {
       continue;
     }
     table_.markAlertSent(ev.id, level);
-    (void)broadcast(AlertIssuedPayload{ev.id, level, self_}, now);  // peers' backup delay covers a lost copy
+    (void)broadcast(AlertIssuedPayload{ev.id, level, self_}, now);
+    if (issued_.full()) issued_.erase_at(0);
+    (void)issued_.push_back(IssuedAlert{ev.id, level, now});  // repeated by anti-entropy (cannot fail: made room)
     if (level == AlertLevel::PRIORITY) {
       ++stats_.priority_alerts_sent;
     } else {

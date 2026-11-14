@@ -72,6 +72,8 @@ class SituationalAwarenessTable {
   // Stores the observation, creating/merging events as needed. Returns the
   // canonical event id, or kNoEvent if it had to be dropped.
   [[nodiscard]] EventId ingestObservation(const SensorObservation& obs, TimeMs now) noexcept;
+  // How far a bearing misses a localised event, as a fraction of its gate (> 1 fails).
+  double bearingGateRatio(const SensorObservation& o, const DetectedEvent& ev) const noexcept;
 
   // Prune expired readings, re-cluster every reading deterministically (the
   // grouping and the ids depend only on the set of readings, not on the order
@@ -110,6 +112,17 @@ class SituationalAwarenessTable {
     std::uint32_t signature = 0;
     bool learned = false;
   };
+  // Alerts sent: kept apart from the events, with where and what was reported,
+  // so that no regrouping, split or rename makes the pack alert the same source
+  // twice, and a confirmed source stays confirmed after its readings age out.
+  struct Alerted {
+    EventId id = kNoEvent;
+    AlertLevel level = AlertLevel::NONE;
+    bool has_position = false;
+    GeoPoint position{};
+    float cep_m = 0.0f;
+    std::uint32_t signature = 0;
+  };
 
   struct ObsRef {
     std::uint8_t ev = 0;  // index into events_
@@ -126,6 +139,7 @@ class SituationalAwarenessTable {
   void inheritMetadata(std::size_t n_refs) noexcept;
   bool consistentWithOwnReading(const SensorObservation& o, const DetectedEvent& ev) const noexcept;
   void addAlias(EventId from, EventId to) noexcept;
+  void applyAlertLedger() noexcept;
   void rename(EventId from, EventId to) noexcept;
   bool shouldMerge(const DetectedEvent& a, const DetectedEvent& b) const noexcept;
   bool gatePasses(const SensorObservation& o, const DetectedEvent& ev, double& metric) const noexcept;
@@ -143,6 +157,7 @@ class SituationalAwarenessTable {
   StaticVector<DetectedEvent, kMaxEvents> events_{};
   StaticVector<Alias, kMaxAliases> aliases_{};
   StaticVector<BenignSig, kMaxKnownSignatures> benign_{};
+  StaticVector<Alerted, kMaxEvents> alerted_{};
 
   // Scratch for recluster(): the new event list is built here, then replaces events_.
   static constexpr std::size_t kMaxReadings = kMaxEvents * kMaxObsPerEvent;

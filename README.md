@@ -19,8 +19,11 @@ The GMCS can route the whole pack but can actively control only one drone in mis
 Needs a C++17 compiler and `make`. No other dependencies. CI builds with GCC and Clang on Ubuntu and Apple Clang on macOS.
 
 ```
-make test     # 40 unit tests
-make sim      # 6-drone scenario with a printed timeline and pass/fail checks
+make test       # 64 unit tests
+make sim        # 6-drone storyline under realistic conditions: timeline, summary, pass/fail checks
+make sim16      # the 16-drone scenario
+make scenarios  # every scenario file, one line each
+make mc         # Monte Carlo over the storyline and the 16-drone scenario (TRIALS=200)
 make check    # tests and sim under AddressSanitizer + UndefinedBehaviorSanitizer
 make audit    # grep the flight library for banned constructs (new, throw, std::vector, ...)
 ```
@@ -39,13 +42,50 @@ make corpus            # regenerate the seed corpus
 
 The seed corpus (`fuzz/corpus`, written by `fuzz/make_corpus.cpp`) holds one record of each type plus scenarios: triangulate, confirm, dismiss, two beacons on one frequency, and replay, reboot and leave. Inputs the fuzzer found are kept there as regression seeds (`regress-*`).
 
+## Simulation
+
+`sim/` runs the real flight library on simulated drones. Scenario files in `sim/scenarios/` describe the pack, the sources, the terrain, the radio, the sensors, scripted faults and the pass/fail checks:
+
+| File | What it is |
+|---|---|
+| `ideal6.scn` | The original 6-drone storyline with the original idealised models (no latency, independent 5 % loss, flat ground, no multipath) |
+| `storyline6.scn` | The same storyline under realistic conditions (the default for `make sim`) |
+| `pack16.scn` | All 16 drones in two rows; two distress beacons on one frequency, a fire with no RF emission, a ridge, IR clutter, a lost verifier, a mesh partition and heal, an operator dismissal |
+
+What the models add over the original sim:
+
+- **Radio:** fixed latency plus exponential jitter, and bursty loss from a Gilbert-Elliott chain on every link. Drones' clocks are a few ms apart, and each drone ticks at its own phase.
+- **Terrain:** Gaussian hills and ridges, with line of sight and earth curvature (4/3 earth radius for radio, 1 for optics). Terrain can mask DF, imaging and mesh links.
+- **DF multipath:** a drone that enters a reflection sees the source 10 to 30° off for 5 to 30 s, and reflections are four times as likely at low elevation. The DF does not know it is reflected.
+- **Clutter:** false imaging detections as a Poisson process per drone.
+- **Ground:** C2 latency per link type at the GMCS.
+
+`pack_sim <file> --mc N` runs N trials, reseeding every random process and moving each source by up to the scenario's jitter. It reports time to first alert, time to PRIORITY and PRIORITY error, each as p5, p50, p95 and max. It also reports false alerts, split by cause (clutter, or a real source mislocalised by multipath, from the sim's ground-truth label on every reading), duplicates, FCS requests, mesh load and the pass rate of every check. `--mc-json` writes the distributions. A run is a pure function of (scenario, seed); the Monte Carlo output does not depend on the thread count.
+
+### What the realistic simulation found
+
+Running the flight code under these conditions exposed defects that the synchronised, idealised sim had hidden. All of them are fixed in the flight library and covered by unit tests:
+
+| Defect | Fix |
+|---|---|
+| Two verifiers on one event traded primary and secondary roles every few seconds, re-pointing both aircraft | Incumbency is per slot (median time to PRIORITY in the storyline: 319 s to 162 s) |
+| Drones with slightly different tables both diverted; the loser of the claim turned back half a second later (up to 115 FCS requests per drone in the 16-drone run) | Claim before flying: the FCS is asked to divert once the slot has held for 1.5 s (median 85 to 19 requests) |
+| The FCS was re-pointed whenever the estimate moved 3 CEP, which noise alone does about 4 % of the time | The move must exceed 3x the combined error of both estimates and last 8 s; a much better fix re-points once |
+| A second reading from the same DF that a noisy gate called "different" was kept forever, splitting the source, and the split sustained itself | A newer reading supersedes an older one that agrees with it (gate widened by sqrt 2 for two noisy readings) or that the sensor stopped reporting |
+| Two reflected bearings always cross: ghost ADVISORY alerts (1.3 per drone-hour) | A bearing-only ADVISORY needs 3 bearings and must hold for 10 s; consensus over bearing pairs rejects reflected outliers (0.04 per drone-hour) |
+| A false IR detection plus DF bearings passing near it made a false PRIORITY (0.1 per drone-hour in the 16-drone run) | Bearings count as a second sensor type only if at least three, none explained better by another source on the frequency, triangulate there on their own (0 in every scenario since) |
+| A regrouped source lost its "alert sent" flag and was alerted again; a confirmed source was re-verified after its fixes aged out | A ledger of alerts by id and by place |
+| A missed `ALERT_ISSUED` notice in a radio fade let a backup drone alert again | Each drone repeats its notices for 20 s |
+| Lone bearings and reflections on a frequency already localised competed for verifiers with the real source | Their urgency is halved, and a lone bearing on a localised frequency is not tasked |
+
 ## Continuous integration
 
 `.github/workflows/ci.yml` runs on every push and pull request:
 
 | Job | What it checks |
 |---|---|
-| build + test | `make test` and `make sim` with GCC and Clang (Ubuntu) and Apple Clang (macOS), plus a check that two simulation runs are byte-identical, plus `make audit` |
+| build + test | `make test`, every scenario and `make audit` with GCC and Clang (Ubuntu) and Apple Clang (macOS); two runs of each realistic scenario must be byte-identical. Scenario checks gate on Linux; macOS runs them for information (libm differs in the last bit, which changes the random trajectory) |
+| Monte Carlo | 20 trials of each realistic scenario; the distributions are kept as a build artifact |
 | ASan + UBSan | Tests and simulation under AddressSanitizer and UndefinedBehaviorSanitizer |
 | fuzz | libFuzzer with ASan and UBSan on the decoder and receive path for 120 s; any crashing input is kept as an artifact. Every matrix build also replays the committed corpus |
 | CMake + ctest | The CMake build and its test registration |
@@ -119,7 +159,9 @@ These are the open items you should know about before relying on any of this:
 - **The cipher is not a validated module.** ChaCha20-Poly1305 is implemented from RFC 8439 and checked against the RFC's vectors and against OpenSSL on 858 random cases, but it has not been through a crypto-module validation or a side-channel review on the target. For anything that flies, put a validated module behind `crypto.hpp`; nothing else depends on how it is implemented.
 - **Insiders can forge within an epoch.** Keys are symmetric, so every pack member holds the epoch key. A drone captured with its key store intact can forge frames in any member's name until the next epoch. Revocation drops its own identity at once; re-keying without it ends the rest. Only per-sender signatures would stop an insider sooner.
 - **The boot session must persist.** It has to come from a non-volatile counter that increases on every boot. If it repeats, nonces repeat and the mesh loses secrecy and integrity. Key fill, key storage and the C2 re-key message are outside this repo.
-- **No flight validation.** All performance numbers come from a software simulation with idealised sensors and radio.
+- **No flight validation.** All performance numbers come from a software simulation. Its radio, terrain, multipath and clutter models are generic, with parameters chosen to be plausible, not measured on the real radio, DF or airframe.
+- **The mesh does not relay.** Every frame is one hop. A pack wider than the radio range splits into groups that cannot hear each other, and each group alerts on its own. `pack16.scn` keeps the pack inside 60 km for that reason.
+- **Single-sensor thermal detections raise an ADVISORY.** One IR detection of a thermal hazard is a fix with confidence 0.8, which meets the advisory gate. In `pack16.scn` IR clutter (0.2 false detections per drone-hour) is about half of the false advisories. Requiring two observers for a fix-only ADVISORY would remove them, at the cost of later warnings for a fire only one drone has seen; that is a programme decision.
 - **The Model 8270's real interfaces are assumed.** Everything touches hardware through `hal.hpp`; the bus choices in deliverable 3 are recommendations, not an ICD.
 - **The FCS interface has no reply.** A real one needs accept / refuse.
 - **Time assumes a shared GNSS-disciplined clock.** GNSS-denied operation is not handled.

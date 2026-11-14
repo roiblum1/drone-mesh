@@ -649,6 +649,9 @@ TEST(advisory_then_priority_exactly_once) {
   p->run(2000);
   reportBeacon(*p, {1, 2, 3, 4});
   p->run(5000);
+  // A position from bearings alone must hold before anyone is warned (multipath guard).
+  CHECK(p->totalAlerts(AlertLevel::ADVISORY) == 0);
+  p->run(MeshConfig{}.advisory_bearing_hold_ms);
   // RF-only picture: early-warning ADVISORY, once, across the whole pack.
   CHECK(p->totalAlerts(AlertLevel::ADVISORY) == 1);
   CHECK(p->totalAlerts(AlertLevel::PRIORITY) == 0);
@@ -699,7 +702,7 @@ TEST(alert_owner_failover) {
   // The would-be owner cannot reach the GMCS: the next drone in line takes over.
   reportBeacon(*p, {1, 2, 3, 4});
   for (auto& g : p->gmcs) g.fail = true;
-  p->run(3000);
+  p->run(3000 + MeshConfig{}.advisory_bearing_hold_ms);
   CHECK(p->totalAlerts(AlertLevel::ADVISORY) == 0);
   std::uint32_t failures = 0;
   for (std::size_t i = 0; i < 5; ++i) failures += p->mgr[i]->stats().alert_send_failures;
@@ -1847,7 +1850,7 @@ TEST(partition_then_heal_converges_to_one_event) {
   p->run(6000);                                            // each side times the other out
   CHECK(p->mgr[0]->table().peerCount() == 2 && p->mgr[3]->table().peerCount() == 2);
   reportBeacon(*p, {0, 1, 2, 3, 4, 5});
-  p->run(5000);
+  p->run(5000 + MeshConfig{}.advisory_bearing_hold_ms);
   // Each side localised the beacon under its own id and warned the GMCS.
   const EventId id_a = soleEvent(*p->mgr[0]) != nullptr ? soleEvent(*p->mgr[0])->id : kNoEvent;
   const EventId id_b = soleEvent(*p->mgr[3]) != nullptr ? soleEvent(*p->mgr[3])->id : kNoEvent;
@@ -1938,6 +1941,270 @@ TEST(dismissal_during_partition_reaches_the_other_side_on_heal) {
     CHECK(p->mgr[i]->table().isBenign(kIsm));
     CHECK(!p->mgr[i]->isVerifying());
   }
+}
+
+// ------------------------- fixes found by the realistic simulation (sim/)
+
+TEST(two_bearings_alone_never_raise_an_advisory) {
+  // Two lines always cross: two reflected bearings make a convincing ghost.
+  MeshConfig cfg;
+  DetectedEvent ev;
+  ev.id = 1;
+  ev.cls = EventClass::DISTRESS_BEACON;
+  const GeoPoint truth = enu(10000, 2000);
+  for (DroneId k = 0; k < 2; ++k) {
+    SensorObservation o = bearingObs(enu(0, -6000.0 + 12000.0 * k), truth);
+    o.observer = static_cast<DroneId>(2 + k);
+    o.observer_position = enu(0, -6000.0 + 12000.0 * k);
+    CHECK(ev.observations.push_back(o));
+  }
+  fuseEvent(ev, cfg);
+  CHECK(ev.localized && ev.confidence >= 0.6f);
+  CHECK(evaluateAlertLevel(ev, false, cfg) == AlertLevel::NONE);
+  SensorObservation third = bearingObs(enu(-3000, 0), truth);
+  third.observer = 4;
+  third.observer_position = enu(-3000, 0);
+  CHECK(ev.observations.push_back(third));
+  fuseEvent(ev, cfg);
+  CHECK(evaluateAlertLevel(ev, false, cfg) == AlertLevel::ADVISORY);
+}
+
+TEST(a_bearing_through_a_clutter_fix_does_not_confirm_it) {
+  // One false IR detection plus DF bearings that pass near it (towards another source
+  // on the frequency) must not make a PRIORITY: the bearings belong to that source.
+  MeshConfig cfg;
+  auto t = std::make_unique<SituationalAwarenessTable>(1, cfg);
+  const TimeMs now = 1'700'000'000'000ULL;
+  const GeoPoint beacon = enu(20000, 0);
+  // The real beacon, localised by four bearings.
+  for (DroneId k = 0; k < 4; ++k) {
+    SensorObservation o = bearingObs(enu(0, -9000.0 + 6000.0 * k), beacon);
+    o.observer_position = enu(0, -9000.0 + 6000.0 * k);
+    (void)t->ingestObservation(tableObs(o, static_cast<DroneId>(2 + k), now, 0x00020001u), now);
+  }
+  // A clutter fix 4 km beyond the beacon, on the line from drone 2 and drone 3.
+  SensorObservation clutter = fixObs(SensorType::IR, enu(24000, -400), 60.0f, 0.8f);
+  clutter.class_hint = EventClass::THERMAL_HAZARD;
+  (void)t->ingestObservation(tableObs(clutter, 9, now), now);
+  t->refresh(now);
+  for (const auto& ev : t->events()) {
+    CHECK(evaluateAlertLevel(ev, false, cfg, t.get()) != AlertLevel::PRIORITY);
+  }
+}
+
+TEST(a_newer_reading_supersedes_the_old_and_a_stale_reflection_ages_out) {
+  MeshConfig cfg;
+  auto t = std::make_unique<SituationalAwarenessTable>(1, cfg);
+  const TimeMs now = 1'700'000'000'000ULL;
+  const GeoPoint beacon = enu(15000, 3000);
+  for (DroneId k = 0; k < 4; ++k) {
+    SensorObservation o = bearingObs(enu(0, -9000.0 + 6000.0 * k), beacon);
+    o.observer_position = enu(0, -9000.0 + 6000.0 * k);
+    (void)t->ingestObservation(tableObs(o, static_cast<DroneId>(2 + k), now, 0x00020001u), now);
+  }
+  // Drone 2 is in a reflection for one reading (25 deg off), then sees the source directly again.
+  SensorObservation reflected = bearingObs(enu(0, -9000), beacon, 25.0);
+  reflected.observer_position = enu(0, -9000);
+  (void)t->ingestObservation(tableObs(reflected, 2, now + 2000, 0x00020001u), now + 2000);
+  SensorObservation direct = bearingObs(enu(0, -9000), beacon, 0.5);
+  direct.observer_position = enu(0, -9000);
+  (void)t->ingestObservation(tableObs(direct, 2, now + 4000, 0x00020001u), now + 4000);
+  t->refresh(now + 4000);
+  std::size_t from_two = 0;
+  for (const auto& ev : t->events()) {
+    for (const auto& o : ev.observations) from_two += o.observer == 2 ? 1 : 0;
+  }
+  CHECK(from_two == 2);  // the old direct reading is superseded; the reflection still looks like a second source
+  // The drone keeps reporting the source directly; the reflection is never reported again.
+  const TimeMs later = now + 4000 + cfg.same_sensor_supersede_ms + 1;
+  SensorObservation direct2 = bearingObs(enu(0, -9000), beacon, -0.4);
+  direct2.observer_position = enu(0, -9000);
+  (void)t->ingestObservation(tableObs(direct2, 2, later, 0x00020001u), later);
+  t->refresh(later);
+  from_two = 0;
+  for (const auto& ev : t->events()) {
+    for (const auto& o : ev.observations) from_two += o.observer == 2 ? 1 : 0;
+  }
+  CHECK(from_two == 1);  // the drone stopped reporting it: a reflection, not a source
+}
+
+TEST(a_source_already_alerted_is_not_alerted_again_once_its_readings_age_out) {
+  MeshConfig cfg;
+  auto t = std::make_unique<SituationalAwarenessTable>(1, cfg);
+  const TimeMs now = 1'700'000'000'000ULL;
+  const GeoPoint at = enu(12000, 4000);
+  const EventId id = t->ingestObservation(tableObs(fixObs(SensorType::IR, at, 60.0f), 2, now, 0x00020001u), now);
+  t->refresh(now);
+  t->markAlertSent(id, AlertLevel::PRIORITY);
+  // Every reading expires; later a different drone sees the same source under a new id.
+  const TimeMs later = now + cfg.observation_max_age_ms + 5000;
+  t->refresh(later);
+  CHECK(t->events().empty());
+  const EventId again = t->ingestObservation(tableObs(fixObs(SensorType::EO, enu(12040, 3980), 60.0f), 3, later, 0x00030009u), later);
+  t->refresh(later);
+  const DetectedEvent* ev = t->findEvent(again);
+  CHECK(ev != nullptr && again != id);
+  if (ev != nullptr) {
+    CHECK(ev->priority_sent && ev->advisory_sent);  // remembered by place
+    CHECK(!eligibleForTasking(*ev, later, cfg));    // and no aircraft is sent to it again
+  }
+}
+
+TEST(a_second_event_on_a_localised_frequency_waits_its_turn) {
+  MeshConfig cfg;
+  auto t = std::make_unique<SituationalAwarenessTable>(1, cfg);
+  const TimeMs now = 1'700'000'000'000ULL;
+  const GeoPoint main_src = enu(15000, 0);
+  for (DroneId k = 0; k < 4; ++k) {
+    SensorObservation o = bearingObs(enu(0, -9000.0 + 6000.0 * k), main_src);
+    o.observer_position = enu(0, -9000.0 + 6000.0 * k);
+    (void)t->ingestObservation(tableObs(o, static_cast<DroneId>(2 + k), now, 0x00020001u), now);
+  }
+  SensorObservation lone = bearingObs(enu(0, 30000), enu(20000, 45000));  // far off, same frequency
+  lone.observer_position = enu(0, 30000);
+  (void)t->ingestObservation(tableObs(lone, 9, now, 0x00090001u), now);
+  t->refresh(now);
+  updateUrgencies(*t, now);
+  const DetectedEvent* big = nullptr;
+  const DetectedEvent* small = nullptr;
+  for (const auto& ev : t->events()) (ev.observer_count >= 4 ? big : small) = &ev;
+  CHECK(big != nullptr && small != nullptr);
+  if (big == nullptr || small == nullptr) return;
+  CHECK(small->urgency < 0.6f * big->urgency);
+  // And a lone bearing on that frequency is not worth an aircraft.
+  DroneList drones;
+  for (DroneId id = 2; id <= 6; ++id) {
+    DroneState d;
+    d.id = id;
+    d.mode = DroneMode::PACK_ROUTING;
+    d.installed_sensors = maskOf(SensorType::IR);
+    d.position = enu(0, -3000.0 * id);
+    d.speed_mps = 40.0f;
+    d.endurance_remaining_s = 4.0f * 3600.0f;
+    d.bingo_endurance_s = 1800.0f;
+    CHECK(drones.push_back(d));
+  }
+  MeshConfig roomy = cfg;
+  roomy.max_diversion_fraction = 1.0;  // so the diversion budget does not hide the rule
+  AssignmentList plan;
+  planAssignments(*t, drones, now, roomy, plan);
+  CHECK(plan.size() >= 2);
+  for (const auto& a : plan) CHECK(a.event_id != small->id);
+}
+
+TEST(verifiers_keep_their_roles_and_claim_before_flying) {
+  auto p = std::make_unique<Pack>(5);
+  placeLine(*p);
+  p->run(2000);
+  reportBeacon(*p, {1, 2, 3, 4});
+  // Claim before flying: nobody asks the FCS to divert in the first second.
+  p->run(1000);
+  for (std::size_t i = 0; i < 5; ++i) CHECK(p->guidance[i].requests == 0);
+  // Keep the bearings coming for a minute with noise; the two verifiers keep their roles.
+  for (int round = 0; round < 30; ++round) {
+    const GeoPoint truth = enu(kTruthE, kTruthN);
+    for (std::size_t i = 1; i < 5; ++i) {
+      const double noise = static_cast<double>((round * 5 + static_cast<int>(i) * 3) % 7 - 3) * 0.7;
+      CHECK(p->mgr[i]->reportLocalDetection(bearingObs(p->mgr[i]->exportedState().position, truth, noise)));
+    }
+    p->run(2000);
+  }
+  int verifying = 0;
+  int requests = 0;
+  for (std::size_t i = 0; i < 5; ++i) {
+    verifying += p->mgr[i]->isVerifying() ? 1 : 0;
+    requests += p->guidance[i].requests;
+    CHECK(p->guidance[i].requests <= 2);  // no primary/secondary swapping
+  }
+  CHECK(verifying >= 1 && requests >= 1);
+}
+
+TEST(a_backup_that_missed_the_alert_notice_still_stands_down) {
+  // The owner's ALERT_ISSUED is lost; it is repeated by anti-entropy, so the
+  // backup that would have alerted a few seconds later does not.
+  auto p = std::make_unique<Pack>(5);
+  placeLine(*p);
+  p->run(2000);
+  reportBeacon(*p, {1, 2, 3, 4});
+  p->run(MeshConfig{}.advisory_bearing_hold_ms - 500);
+  p->bus.drop_permille = 1000;  // the notice goes nowhere
+  p->run(1200);
+  p->bus.drop_permille = 0;
+  p->run(15000);
+  CHECK(p->totalAlerts(AlertLevel::ADVISORY) == 1);
+}
+
+TEST(bearings_that_belong_to_other_sources_do_not_corroborate) {
+  // Two beacons on one frequency. One bearing towards each crosses at a clutter
+  // fix; each bearing is better explained by its own beacon, so the crossing
+  // confirms nothing (two bearings allowed here, to isolate that rule).
+  MeshConfig cfg;
+  cfg.priority_min_bearings = 2;
+  auto t = std::make_unique<SituationalAwarenessTable>(1, cfg);
+  const TimeMs now = 1'700'000'000'000ULL;
+  const GeoPoint b1 = enu(20000, 10000);
+  const GeoPoint b2 = enu(20000, -10000);
+  DroneId observer = 2;
+  for (const GeoPoint& b : {b1, b2}) {
+    for (int k = 0; k < 3; ++k) {  // spread out, so each beacon is triangulated on its own
+      const GeoPoint from = enu(-10000.0 + 15000.0 * k, b.lat_deg > kOrigin.lat_deg ? 30000.0 : -30000.0);
+      SensorObservation o = bearingObs(from, b);
+      o.observer_position = from;
+      (void)t->ingestObservation(tableObs(o, observer, now, (static_cast<EventId>(observer) << 16U) | 1U), now);
+      ++observer;
+    }
+  }
+  // Bearings from (0, 10 km) towards b2 and from (0, -10 km) towards b1 cross near (10, 0) km.
+  SensorObservation x = bearingObs(enu(0, 10000), b2);
+  x.observer_position = enu(0, 10000);
+  SensorObservation y = bearingObs(enu(0, -10000), b1);
+  y.observer_position = enu(0, -10000);
+  (void)t->ingestObservation(tableObs(x, 20, now), now);
+  (void)t->ingestObservation(tableObs(y, 21, now), now);
+  SensorObservation clutter = fixObs(SensorType::IR, enu(10000, 150), 60.0f, 0.8f);
+  clutter.class_hint = EventClass::THERMAL_HAZARD;
+  (void)t->ingestObservation(tableObs(clutter, 22, now), now);
+  t->refresh(now);
+  int priority = 0;
+  for (const auto& ev : t->events()) priority += evaluateAlertLevel(ev, false, cfg, t.get()) == AlertLevel::PRIORITY ? 1 : 0;
+  CHECK(priority == 0);
+}
+
+TEST(incumbency_is_per_slot) {
+  // The current primary keeps the primary role against the current secondary,
+  // even when the secondary is slightly better placed.
+  MeshConfig cfg;
+  auto t = std::make_unique<SituationalAwarenessTable>(1, cfg);
+  const TimeMs now = 1'700'000'000'000ULL;
+  SensorObservation o = fixObs(SensorType::RF_DF, enu(0, 0), 60.0f, 0.9f);
+  o.sensor = SensorType::ANOMALY;
+  o.class_hint = EventClass::THERMAL_HAZARD;
+  const EventId id = t->ingestObservation(tableObs(o, 9, now, 0x00090001u), now);
+  t->refresh(now);
+  updateUrgencies(*t, now);
+  DetectedEvent* ev = t->findEvent(id);
+  CHECK(ev != nullptr && ev->urgency >= cfg.dual_verifier_urgency);
+  if (ev == nullptr) return;
+  ev->verifier[0] = VerifierSlot{2, 0.5f, now};  // drone 2 is primary
+  ev->verifier[1] = VerifierSlot{3, 0.5f, now};  // drone 3 secondary, and a little closer
+  DroneList drones;
+  for (DroneId id2 = 2; id2 <= 3; ++id2) {
+    DroneState d;
+    d.id = id2;
+    d.mode = DroneMode::VERIFYING;
+    d.installed_sensors = maskOf(SensorType::IR);
+    d.position = enu(-12000.0 + 400.0 * id2, 0);
+    d.speed_mps = 40.0f;
+    d.endurance_remaining_s = 4.0f * 3600.0f;
+    d.bingo_endurance_s = 1800.0f;
+    d.tasked_event = id;
+    CHECK(drones.push_back(d));
+  }
+  cfg.max_diversion_fraction = 1.0;
+  AssignmentList plan;
+  planAssignments(*t, drones, now, cfg, plan);
+  CHECK(plan.size() == 2);
+  for (const auto& a : plan) CHECK((a.drone == 2 && a.role == 0) || (a.drone == 3 && a.role == 1));
 }
 
 // ----------------------------------------------------------------------- main

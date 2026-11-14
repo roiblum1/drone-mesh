@@ -1,6 +1,8 @@
 # Model 8270 pack-mesh: library, simulation, tests.
 #   make test    build + run unit tests
-#   make sim     build + run the 6-drone scenario
+#   make sim     build + run the 6-drone storyline (sim/scenarios/storyline6.scn)
+#   make sim16   the 16-drone scenario;  make scenarios  every scenario file
+#   make mc      Monte Carlo over both (TRIALS=200, writes build/mc-*.json)
 #   make check   tests + sim under ASan/UBSan
 #   make audit   grep the flight library for banned constructs
 #   make fuzz    libFuzzer + ASan/UBSan on the decoder and receive path (clang, FUZZ_SECONDS)
@@ -16,6 +18,10 @@ OPT      ?= -O2 -g
 
 LIB_SRCS := $(wildcard src/*.cpp)
 HDRS     := $(wildcard include/amc8270/mesh/*.hpp)
+SIM_SRCS := sim/pack_sim.cpp sim/scenario.cpp sim/world.cpp
+SIM_HDRS := sim/sim.hpp
+SCENARIOS := $(wildcard sim/scenarios/*.scn)
+TRIALS   ?= 200
 
 BUILD    := build
 SAN      := build-san
@@ -27,7 +33,7 @@ SAN_LIB_OBJS := $(patsubst src/%.cpp,$(SAN)/%.o,$(LIB_SRCS))
 CXXFLAGS     := $(STD) $(WARN) $(FLIGHT) $(INC) $(OPT)
 SAN_CXXFLAGS := $(STD) $(WARN) $(FLIGHT) $(INC) -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=undefined
 
-.PHONY: all test sim check audit fuzz fuzz-regress corpus clean
+.PHONY: all test sim sim16 scenarios mc check audit fuzz fuzz-regress corpus clean
 all: $(BUILD)/mesh_tests $(BUILD)/pack_sim
 
 $(BUILD)/%.o: src/%.cpp $(HDRS) | $(BUILD)
@@ -39,14 +45,14 @@ $(SAN)/%.o: src/%.cpp $(HDRS) | $(SAN)
 $(BUILD)/mesh_tests: tests/test_main.cpp $(LIB_OBJS) $(HDRS) | $(BUILD)
 	$(CXX) $(CXXFLAGS) tests/test_main.cpp $(LIB_OBJS) -o $@
 
-$(BUILD)/pack_sim: sim/pack_sim.cpp $(LIB_OBJS) $(HDRS) | $(BUILD)
-	$(CXX) $(CXXFLAGS) sim/pack_sim.cpp $(LIB_OBJS) -o $@
+$(BUILD)/pack_sim: $(SIM_SRCS) $(SIM_HDRS) $(LIB_OBJS) $(HDRS) | $(BUILD)
+	$(CXX) $(CXXFLAGS) $(SIM_SRCS) $(LIB_OBJS) -pthread -o $@
 
 $(SAN)/mesh_tests: tests/test_main.cpp $(SAN_LIB_OBJS) $(HDRS) | $(SAN)
 	$(CXX) $(SAN_CXXFLAGS) tests/test_main.cpp $(SAN_LIB_OBJS) -o $@
 
-$(SAN)/pack_sim: sim/pack_sim.cpp $(SAN_LIB_OBJS) $(HDRS) | $(SAN)
-	$(CXX) $(SAN_CXXFLAGS) sim/pack_sim.cpp $(SAN_LIB_OBJS) -o $@
+$(SAN)/pack_sim: $(SIM_SRCS) $(SIM_HDRS) $(SAN_LIB_OBJS) $(HDRS) | $(SAN)
+	$(CXX) $(SAN_CXXFLAGS) $(SIM_SRCS) $(SAN_LIB_OBJS) -pthread -o $@
 
 $(BUILD) $(SAN) $(FUZZ_OUT):
 	mkdir -p $@
@@ -70,11 +76,21 @@ test: $(BUILD)/mesh_tests
 	./$(BUILD)/mesh_tests
 
 sim: $(BUILD)/pack_sim
-	./$(BUILD)/pack_sim
+	./$(BUILD)/pack_sim sim/scenarios/storyline6.scn
+
+sim16: $(BUILD)/pack_sim
+	./$(BUILD)/pack_sim sim/scenarios/pack16.scn
+
+scenarios: $(BUILD)/pack_sim
+	@for f in $(SCENARIOS); do ./$(BUILD)/pack_sim --quiet $$f | tail -n 1 | sed "s|^|$$f: |" || exit 1; done
+
+mc: $(BUILD)/pack_sim
+	./$(BUILD)/pack_sim sim/scenarios/storyline6.scn --mc $(TRIALS) --mc-json $(BUILD)/mc-storyline6.json
+	./$(BUILD)/pack_sim sim/scenarios/pack16.scn --mc $(TRIALS) --mc-json $(BUILD)/mc-pack16.json
 
 check: $(SAN)/mesh_tests $(SAN)/pack_sim $(SAN)/fuzz_replay
 	./$(SAN)/mesh_tests
-	./$(SAN)/pack_sim > /dev/null
+	for f in $(SCENARIOS); do ./$(SAN)/pack_sim --quiet $$f > /dev/null || exit 1; done
 	./$(SAN)/fuzz_replay fuzz/corpus
 
 # New inputs go to $(FUZZ_OUT)/corpus; fuzz/corpus (the committed seeds) is read only.

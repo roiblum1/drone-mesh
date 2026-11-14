@@ -57,7 +57,16 @@ void planAssignments(const SituationalAwarenessTable& table, const DroneList& dr
 // Write the plan into the events' verifier slots (clears slots not in the plan).
 void applyAssignments(SituationalAwarenessTable& table, const AssignmentList& plan, TimeMs now) noexcept;
 
-AlertLevel evaluateAlertLevel(const DetectedEvent& ev, bool benign, const MeshConfig& cfg) noexcept;
+// Sensor types that each place the source on their own at the event's position:
+// a fix does; bearings do only if at least priority_min_bearings of them, none
+// better explained by another localised event on the frequency (needs `table`),
+// triangulate there without the fixes.
+unsigned corroboratingModalities(const SituationalAwarenessTable* table, const DetectedEvent& ev,
+                                 const MeshConfig& cfg) noexcept;
+
+// PRIORITY needs priority_min_modalities sensor types that corroborate (above).
+AlertLevel evaluateAlertLevel(const DetectedEvent& ev, bool benign, const MeshConfig& cfg,
+                              const SituationalAwarenessTable* table = nullptr) noexcept;
 
 // Position of `self` in the ordered list of drones allowed to speak to the
 // GMCS for this event (primary, secondary, observers, then any free drone),

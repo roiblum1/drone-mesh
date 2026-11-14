@@ -121,7 +121,18 @@ class PackMeshManager {
   TimeMs last_anti_entropy_ms_ = 0;
   TimeMs last_eval_ms_ = 0;
   TimeMs last_claim_ms_ = 0;
+  TimeMs retask_pending_since_ms_ = 0;  // when the target first looked moved (0 = not)
+  // An assignment claimed but not yet flown (claim before flying).
+  EventId pending_event_ = kNoEvent;
+  std::uint8_t pending_role_ = 0;
+  TimeMs pending_since_ms_ = 0;
   std::uint32_t ae_cursor_ = 0;  // rotating start of the anti-entropy re-send
+  struct IssuedAlert {
+    EventId event = kNoEvent;
+    AlertLevel level = AlertLevel::NONE;
+    TimeMs at_ms = 0;
+  };
+  StaticVector<IssuedAlert, 8> issued_{};  // own recent alerts, re-announced by anti-entropy
   bool heartbeat_requested_ = false;
   MeshStats stats_{};
 };

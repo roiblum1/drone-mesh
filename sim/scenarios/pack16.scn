@@ -1,0 +1,81 @@
+# Sixteen drones, the full pack, in two staggered rows of eight heading east,
+# under the realistic models of storyline6.scn plus single-sensor IR clutter.
+#
+#   beacon1, beacon2  two 406.025 MHz distress beacons (with a thermal source)
+#                     42 km apart: the same frequency must give two events
+#   fire              a thermal hazard with no RF emission: only an imager can
+#                     find it, when a drone passes within 3 km (drone 3, ~400 s)
+#   ism               a novel 433.92 MHz emitter, dismissed by the operator
+#   wx                a pre-briefed benign weather radio
+#   terrain           an east-west ridge that hides beacon2 from part of the pack
+#   faults            beacon1's verifier is lost; the rear row is cut off from
+#                     the front row for a minute, then the mesh heals
+name     pack16
+duration 900
+seed     1
+origin   36.0 -12.0
+altitude 3000
+speeds   40 45 55
+
+radio    range_km 60 latency_ms 10 jitter_ms 25 loss_good 0.02 loss_bad 0.6 p_gb 0.01 p_bg 0.1 terrain on skew_ms 5
+df       range_km 35 sigma_deg 2.5 period_s 2 mp_prob 0.02 mp_bias_deg 30 mp_sigma_deg 3 mp_min_s 5 mp_max_s 30 mp_low_elev_deg 5 mp_low_elev_factor 4
+imaging  passive_km 3 cued_km 10 sigma_m 45 cep_m 70
+clutter  per_drone_hour 0.2 class THERMAL_HAZARD conf 0.8
+c2       los_ms 60 leo_ms 180 geo_ms 650 jitter_ms 30 ack_s 8
+
+# A ridge east of the pack's centre hides beacon2 from the northern drones;
+# the southern half of the pack sees it past the ridge's west end.
+#     e1  n1   e2  n2   height_m width_km
+ridge 26  -12  40  -14  1300     1.5
+#     e_km n_km height_m radius_km
+hill  10   -30  1100     3
+hill  45   20   900      4
+
+# Two rows of eight, 6 km apart in each row, the rear row 12 km behind and
+# offset by 3 km: the whole pack spans 45 km, inside the 60 km radio range.
+# (The mesh does not relay, so a pack wider than radio range splits in two.)
+#     id mode   sensors    links        endur_h  e_km  n_km  [bingo_s]
+drone 1  ACTIVE RF+EO+IR   LOS+LEO+GEO  3.5      0     -21
+drone 2  ROUTE  RF+EO      LOS+LEO+GEO  4.0      0     -15
+drone 3  ROUTE  RF+IR      LOS+LEO+GEO  4.5      0     -9
+drone 4  ROUTE  RF+EO+IR   LOS+LEO+GEO  0.62     0     -3    1800
+drone 5  ROUTE  RF+IR+AN   LEO+GEO      4.1      0     3
+drone 6  ROUTE  RF+EO      LOS+LEO+GEO  4.2      0     9
+drone 7  ROUTE  RF+IR      LOS+LEO+GEO  3.8      0     15
+drone 8  ROUTE  RF+EO+IR   LOS+LEO+GEO  4.4      0     21
+drone 9  ROUTE  RF+IR      LOS+LEO+GEO  4.0      -12   -18
+drone 10 ROUTE  RF+EO      LOS+LEO+GEO  4.3      -12   -12
+drone 11 ROUTE  RF+EO+IR   LEO+GEO      3.9      -12   -6
+drone 12 ROUTE  RF+IR      LOS+LEO+GEO  4.1      -12   0
+drone 13 ROUTE  RF+EO      NONE         4.6      -12   6
+drone 14 ROUTE  RF+IR+AN   LOS+LEO+GEO  4.0      -12   12
+drone 15 ROUTE  RF+EO      LOS+LEO+GEO  3.7      -12   18
+drone 16 ROUTE  RF+EO+IR   LOS+LEO+GEO  4.2      -12   24
+
+#       label    sig     e_km  n_km  on_s  class            options
+emitter beacon1  406025  22    5     30    DISTRESS_BEACON  thermal
+emitter beacon2  406025  34    -26   180   DISTRESS_BEACON  thermal
+emitter fire     0       16    -12   0     THERMAL_HAZARD   thermal
+emitter ism      433920  30    30    60    RF_EMITTER
+emitter wx       162550  8     -40   0     RF_EMITTER
+benign  162550
+
+at 240 lose_verifier beacon1
+at 300 partition 9,10,11,12,13,14,15,16
+at 360 heal
+at 500 dismiss ism
+
+mc trials 100 jitter_km 4 jitter_on_s 20
+
+# Gated checks are the ones the pack meets in (nearly) every Monte Carlo trial.
+# How quickly beacon1 and beacon2 are confirmed varies a lot with the draw
+# (clutter and reflections compete for verifiers): see `make mc` for that.
+expect advisory_within beacon1 30
+expect advisory_within fire 600
+expect priority_within fire 600
+expect never_tasked 1
+expect never_tasked 4
+expect reassigned_after_loss beacon1
+expect quiet wx
+expect dismissal_learned ism
+expect max_fcs_requests 30

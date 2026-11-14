@@ -1,0 +1,58 @@
+# The 6-drone storyline (see ideal6.scn) under realistic conditions:
+#   - radio: 8 ms latency plus exponential jitter (mean 20 ms), Gilbert-Elliott
+#     loss per link (2 % in good state, 60 % in a fade; fades start on 1 % of
+#     datagrams and last about ten), drones' clocks up to 5 ms apart, terrain
+#     masking of mesh links
+#   - terrain: a hill between the pack and the ISM emitter, a ridge to the north
+#   - DF multipath: 2 % of readings enter a reflection that offsets the bearing
+#     by 10-30 deg for 5-30 s; four times as likely below 5 deg elevation
+#   - every drone ticks at its own phase, sensors sample at their own phase
+name     storyline6
+duration 600
+seed     1
+origin   36.0 -12.0
+altitude 3000
+speeds   40 45 55
+
+radio    range_km 60 latency_ms 8 jitter_ms 20 loss_good 0.02 loss_bad 0.6 p_gb 0.01 p_bg 0.1 terrain on skew_ms 5
+df       range_km 35 sigma_deg 2.5 period_s 2 mp_prob 0.02 mp_bias_deg 30 mp_sigma_deg 3 mp_min_s 5 mp_max_s 30 mp_low_elev_deg 5 mp_low_elev_factor 4
+imaging  passive_km 3 cued_km 10 sigma_m 45 cep_m 70
+c2       los_ms 60 leo_ms 180 geo_ms 650 jitter_ms 30 ack_s 8
+
+#     e_km n_km height_m radius_km
+hill  24   -15  900      2.5
+#     e1  n1  e2  n2  height_m width_km
+ridge 10  40  40  42  1400     3
+
+#     id mode   sensors   links        endur_h  e_km  n_km  [bingo_s]
+drone 1  ACTIVE RF+EO+IR  LOS+LEO+GEO  3.5      0     -25
+drone 2  ROUTE  RF+EO     LOS+LEO+GEO  4.0      0     -15
+drone 3  ROUTE  RF+IR     LOS+LEO+GEO  4.5      0     -5
+drone 4  ROUTE  RF+IR+AN  LEO+GEO      4.1      0     5
+drone 5  ROUTE  RF+EO     LOS+LEO+GEO  0.5556   0     15    1800
+drone 6  ROUTE  RF+IR     LOS+LEO+GEO  4.2      0     25
+
+#       label   sig     e_km  n_km  on_s  class            options
+emitter beacon  406025  16    8     20    DISTRESS_BEACON  thermal
+emitter ism     433920  30    -12   100   RF_EMITTER
+emitter wx      162550  22    30    10    RF_EMITTER
+benign  162550
+
+at 90  lose_verifier beacon
+at 420 dismiss ism
+
+mc trials 200 jitter_km 3 jitter_on_s 10
+
+expect advisory_once beacon
+expect priority_once beacon 150
+expect priority_after_advisory beacon
+expect never_tasked 1
+expect never_tasked 5
+expect reassigned_after_loss beacon
+expect quiet wx
+expect dismissal_learned ism
+# Under multipath the fused estimate really moves by kilometres for tens of seconds,
+# so the busiest verifier gets a new aim point every 30-60 s (6 in ideal6). A drone
+# may also still be checking a late detection when the run ends, so there is no
+# all_released check here; the Monte Carlo reports both.
+expect max_fcs_requests 30

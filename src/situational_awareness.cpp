@@ -501,6 +501,15 @@ bool SituationalAwarenessTable::consistentWithOwnReading(const SensorObservation
   return true;
 }
 
+// How far a bearing misses a localised event, as a fraction of its gate (> 1 fails).
+double SituationalAwarenessTable::bearingGateRatio(const SensorObservation& o, const DetectedEvent& ev) const noexcept {
+  const double range = std::max(distanceM(o.observer_position, ev.position), 1.0);
+  const double diff = angleDiffDeg(static_cast<double>(o.bearing_deg), bearingDeg(o.observer_position, ev.position));
+  const double ang_unc = std::atan2(static_cast<double>(ev.cep_m), range) * kRad2Deg;
+  const double sigma = std::max(static_cast<double>(o.bearing_sigma_deg), cfg_.min_bearing_sigma_deg);
+  return diff / (3.0 * sigma + cfg_.bearing_gate_deg + ang_unc);
+}
+
 EventId SituationalAwarenessTable::associate(const SensorObservation& o) const noexcept {
   double metric = 0.0;
   if (o.event_hint != kNoEvent) {  // a hint is a preference, not a bypass of the gate
@@ -657,7 +666,6 @@ void SituationalAwarenessTable::validateSlots(DetectedEvent& ev, TimeMs now) con
 
 namespace {
 
-constexpr int kRefinePasses = 3;
 
 // The newest kMaxObsPerEvent of `members` (indices into refs), others marked dropped.
 template <typename ObsAt>
@@ -695,6 +703,33 @@ bool SituationalAwarenessTable::recluster() noexcept {
     refs_[j] = cur;
   }
   for (std::size_t k = 0; k < n; ++k) cluster_of_[k] = kNoCluster;
+
+  // 0. A newer reading from a sensor supersedes an older one that agrees with
+  // it (the same source seen again, as when it arrives) or that the sensor has
+  // stopped reporting (a reflection that has ended). A disagreeing reading that
+  // stays fresh is kept: one sensor hearing two sources on one frequency.
+  std::array<bool, kMaxReadings> superseded{};
+  for (std::size_t i = 0; i < n; ++i) {
+    const SensorObservation& a = obsAt(i);
+    for (std::size_t j = 0; j < n && !superseded[i]; ++j) {
+      const SensorObservation& b = obsAt(j);
+      if (i == j || a.observer != b.observer || a.sensor != b.sensor || !obsOlder(a, b)) continue;
+      if (a.has_fix != b.has_fix) continue;
+      const bool stale = elapsedMs(b.timestamp_ms, a.timestamp_ms) > cfg_.same_sensor_supersede_ms;
+      if (a.has_fix) {
+        const double gate = cfg_.association_gate_m +
+                            cfg_.association_cep_factor * (static_cast<double>(a.fix_cep_m) + static_cast<double>(b.fix_cep_m));
+        superseded[i] = stale || distanceM(a.fix, b.fix) <= gate;
+      } else if (a.signature == b.signature) {
+        // Both readings are noisy: their difference spreads sqrt(2) times as wide as one.
+        const double sigma = std::max({static_cast<double>(a.bearing_sigma_deg), static_cast<double>(b.bearing_sigma_deg),
+                                       cfg_.min_bearing_sigma_deg});
+        const bool agree = angleDiffDeg(static_cast<double>(a.bearing_deg), static_cast<double>(b.bearing_deg)) <=
+                           3.0 * std::sqrt(2.0) * sigma + cfg_.bearing_gate_deg;
+        superseded[i] = stale || agree;
+      }
+    }
+  }
   const auto duplicate = [&](std::size_t k) { return k > 0 && sameReading(obsAt(k), obsAt(k - 1)); };
   const auto add = [&](std::size_t k, std::size_t c) {
     (void)insertObservation(scratch_[c], obsAt(k));  // false only drops the oldest of a full cluster
@@ -722,6 +757,7 @@ bool SituationalAwarenessTable::recluster() noexcept {
 
   // 1. Fixes.
   for (std::size_t k = 0; k < first_bearing; ++k) {
+    if (superseded[k]) continue;
     if (duplicate(k)) {
       cluster_of_[k] = cluster_of_[k - 1];
       continue;
@@ -734,6 +770,7 @@ bool SituationalAwarenessTable::recluster() noexcept {
   // 2. Bearings that fit an anchored cluster.
   const std::size_t anchored = scratch_.size();
   for (std::size_t k = first_bearing; k < n; ++k) {
+    if (superseded[k]) continue;
     if (duplicate(k)) {
       cluster_of_[k] = cluster_of_[k - 1];
       continue;
@@ -751,7 +788,7 @@ bool SituationalAwarenessTable::recluster() noexcept {
     std::size_t r1 = r0;
     std::size_t m = 0;
     while (r1 < n && obsAt(r1).signature == sig) {
-      if (cluster_of_[r1] == kNoCluster && !duplicate(r1)) run[m++] = static_cast<std::uint16_t>(r1);
+      if (cluster_of_[r1] == kNoCluster && !superseded[r1] && !duplicate(r1)) run[m++] = static_cast<std::uint16_t>(r1);
       ++r1;
     }
     // Duplicates follow their twin once it is placed (below).
@@ -795,37 +832,61 @@ bool SituationalAwarenessTable::recluster() noexcept {
       }
       return false;
     };
-    for (int pass = 0; sig != 0 && pass < kRefinePasses; ++pass) {
-      bool moved = false;
-      for (std::size_t g = 0; g < n_groups && g < 0xFE; ++g) {
-        std::size_t count = 0;
-        collect(g, count);
-        if (count < 3) continue;  // two bearings alone cannot disagree with each other
-        for (std::size_t a = 0; a < count; ++a) {
-          DetectedEvent rest;
-          for (std::size_t b = 0; b < count; ++b) {
-            if (b != a) (void)insertObservation(rest, obsAt(run[members[b]]));
+    // Consensus: in each group every pair of bearings proposes a position; the
+    // proposal most bearings agree with wins (ties to the tighter one) and the
+    // bearings that disagree move on to the next group. Unlike fitting all of
+    // them and dropping the worst, this still works when several drones are in
+    // a reflection at once and the whole group will not triangulate at all.
+    for (std::size_t g = 0; sig != 0 && g < n_groups && g < 0xFE; ++g) {
+      std::size_t count = 0;
+      collect(g, count);
+      if (count < 3) continue;  // two bearings alone cannot disagree with each other
+      const LocalFrame frame(obsAt(run[members[0]]).observer_position);
+      std::size_t best_inliers = 0;
+      double best_cep = 0.0;
+      DetectedEvent best;
+      for (std::size_t a = 0; a < count; ++a) {
+        for (std::size_t b = a + 1; b < count; ++b) {
+          std::array<BearingLine, 2> pair{};
+          const SensorObservation* ab[2] = {&obsAt(run[members[a]]), &obsAt(run[members[b]])};
+          for (std::size_t k = 0; k < 2; ++k) {
+            pair[k].origin = frame.toEnu(ab[k]->observer_position);
+            pair[k].bearing_rad = static_cast<double>(ab[k]->bearing_deg) * kDeg2Rad;
+            pair[k].sigma_rad = std::max(static_cast<double>(ab[k]->bearing_sigma_deg), cfg_.min_bearing_sigma_deg) * kDeg2Rad;
           }
-          fuseEvent(rest, cfg_);
-          double metric = 0.0;
-          const SensorObservation& o = obsAt(run[members[a]]);
-          if (!rest.localized || gatePasses(o, rest, metric)) continue;
-          std::size_t to = g + 1;
-          while (to < 0xFE && to < n_groups &&
-                 (groupHoldsKey(to, o) || distanceM(obsAt(run[anchor[to]]).observer_position, o.observer_position) >
-                                              cfg_.max_association_range_m)) {
-            ++to;
+          TriangulationResult tri;
+          if (!triangulate(pair.data(), 2, cfg_.min_geometry_eigen, tri)) continue;
+          DetectedEvent hyp;
+          hyp.position = frame.fromEnu(tri.position, 0.0f);
+          hyp.cep_m = 0.0f;  // agreement on angle alone: a loose pair must not widen the gate for everyone
+          hyp.localized = isPlausible(hyp.position);
+          if (!hyp.localized) continue;
+          std::size_t inliers = 0;
+          for (std::size_t c = 0; c < count; ++c) inliers += bearingGateRatio(obsAt(run[members[c]]), hyp) <= 1.0 ? 1U : 0U;
+          if (inliers > best_inliers || (inliers == best_inliers && tri.cep_m < best_cep)) {
+            best_inliers = inliers;
+            best_cep = tri.cep_m;
+            best = hyp;
           }
-          to = std::min<std::size_t>(to, 0xFE);
-          group[members[a]] = static_cast<std::uint8_t>(to);
-          if (to >= n_groups) {
-            anchor[to] = members[a];
-            n_groups = to + 1;
-          }
-          moved = true;
         }
       }
-      if (!moved) break;
+      if (best_inliers < 3 || best_inliers == count) continue;  // no consensus to act on, or all agree
+      for (std::size_t c = 0; c < count; ++c) {
+        const SensorObservation& o = obsAt(run[members[c]]);
+        if (bearingGateRatio(o, best) <= 1.0) continue;
+        std::size_t to = g + 1;
+        while (to < 0xFE && to < n_groups &&
+               (groupHoldsKey(to, o) || distanceM(obsAt(run[anchor[to]]).observer_position, o.observer_position) >
+                                            cfg_.max_association_range_m)) {
+          ++to;
+        }
+        to = std::min<std::size_t>(to, 0xFE);
+        group[members[c]] = static_cast<std::uint8_t>(to);
+        if (to >= n_groups) {
+          anchor[to] = members[c];
+          n_groups = to + 1;
+        }
+      }
     }
 
     for (std::size_t g = 0; g < n_groups; ++g) {
@@ -839,7 +900,7 @@ bool SituationalAwarenessTable::recluster() noexcept {
       for (std::size_t i = 0; i < count; ++i) add(idx[i], scratch_.size() - 1);
     }
     for (std::size_t k = r0; k < r1; ++k) {
-      if (duplicate(k)) cluster_of_[k] = cluster_of_[k - 1];
+      if (!superseded[k] && duplicate(k)) cluster_of_[k] = cluster_of_[k - 1];
     }
     r0 = r1;
   }
@@ -927,10 +988,17 @@ void SituationalAwarenessTable::assignClusterIds() noexcept {
   };
   for (std::size_t c = 0; c < scratch_.size(); ++c) {
     if (new_ids_[c] != kNoEvent) continue;
-    // No reading names this source: derive an id from its first reading, the same on every drone.
+    // Every id its readings quote went to bigger clusters (a fragment split off
+    // a source). Derive one, the same on every drone and stable from one
+    // refresh to the next: from the lowest id its readings quote, else from its
+    // first reading's sensor.
     const SensorObservation& o = scratch_[c].observations[0];
-    std::uint32_t h = static_cast<std::uint32_t>(o.timestamp_ms ^ (o.timestamp_ms >> 32U)) * 0x9E3779B1U;
-    h ^= static_cast<std::uint32_t>(o.sensor) * 0x85EBCA6BU;
+    EventId lowest_hint = kNoEvent;
+    for (const auto& r : scratch_[c].observations) {
+      if (r.event_hint != kNoEvent && (lowest_hint == kNoEvent || r.event_hint < lowest_hint)) lowest_hint = r.event_hint;
+    }
+    std::uint32_t h = (lowest_hint != kNoEvent ? lowest_hint : static_cast<std::uint32_t>(o.sensor)) * 0x9E3779B1U;
+    h ^= h >> 15U;
     for (std::size_t probe = 0; probe <= kMaxReadings + kMaxEvents; ++probe) {
       const auto counter = static_cast<std::uint16_t>(kDerivedCounterBit | ((h + probe) & 0x7FFFU));
       const EventId id = (static_cast<EventId>(o.observer) << 16U) | counter;
@@ -1031,6 +1099,7 @@ void SituationalAwarenessTable::refresh(TimeMs now) noexcept {
     for (auto& ev : events_) fuseEvent(ev, cfg_);
     mergeDuplicates();
   }
+  applyAlertLedger();
 
   for (auto& ev : events_) {
     validateSlots(ev, now);
@@ -1068,6 +1137,27 @@ std::size_t SituationalAwarenessTable::purgeObserver(DroneId observer) noexcept 
   return removed;
 }
 
+void SituationalAwarenessTable::applyAlertLedger() noexcept {
+  for (const auto& a : alerted_) {
+    // By id (renames and merges resolve through aliases) ...
+    if (DetectedEvent* ev = findEvent(resolve(a.id))) {
+      ev->advisory_sent = true;
+      if (a.level == AlertLevel::PRIORITY) ev->priority_sent = true;
+    }
+    if (!a.has_position) continue;
+    // ... and by place: a cluster inside a reported source's gate is that source
+    // seen again (a fragment once its fixes have aged out), not a new one.
+    for (auto& ev : events_) {
+      if (a.signature != 0 && ev.signature != 0 && a.signature != ev.signature) continue;
+      const double gate = cfg_.association_gate_m +
+                          cfg_.association_cep_factor * (static_cast<double>(a.cep_m) + static_cast<double>(ev.cep_m));
+      if (distanceM(a.position, ev.position) > gate) continue;
+      ev.advisory_sent = true;
+      if (a.level == AlertLevel::PRIORITY) ev.priority_sent = true;
+    }
+  }
+}
+
 ClaimResult SituationalAwarenessTable::applyClaim(EventId event, DroneId claimant, std::uint8_t role, float score,
                                                   TimeMs now) noexcept {
   DetectedEvent* ev = findEvent(resolve(event));
@@ -1094,6 +1184,29 @@ ClaimResult SituationalAwarenessTable::applyClaim(EventId event, DroneId claiman
 
 void SituationalAwarenessTable::markAlertSent(EventId event, AlertLevel level) noexcept {
   DetectedEvent* ev = findEvent(resolve(event));
+  if (event != kNoEvent && level != AlertLevel::NONE) {
+    Alerted entry{event, level};
+    if (ev != nullptr && ev->localized) {
+      entry.has_position = true;
+      entry.position = ev->position;
+      entry.cep_m = ev->cep_m;
+      entry.signature = ev->signature;
+    }
+    bool recorded = false;
+    for (auto& a : alerted_) {
+      if (a.id != event) continue;
+      recorded = true;
+      if (level == AlertLevel::PRIORITY || !a.has_position) {
+        const AlertLevel keep = a.level == AlertLevel::PRIORITY ? AlertLevel::PRIORITY : level;
+        a = entry;
+        a.level = keep;
+      }
+    }
+    if (!recorded) {
+      if (alerted_.full()) alerted_.erase_at(0);  // the oldest; its event has long been reported
+      (void)alerted_.push_back(entry);           // cannot fail: made room above
+    }
+  }
   if (ev == nullptr) return;
   if (level == AlertLevel::PRIORITY) {
     ev->priority_sent = true;
