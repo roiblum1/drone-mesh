@@ -1,0 +1,86 @@
+// Compile-time capacities (no heap after init) and runtime tunables.
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+
+#include "amc8270/mesh/types.hpp"
+
+namespace amc8270::mesh {
+
+inline constexpr std::size_t kMaxPackSize = 16;
+inline constexpr std::size_t kMaxEvents = 64;
+inline constexpr std::size_t kMaxObsPerEvent = 8;
+inline constexpr std::size_t kMaxKnownSignatures = 32;
+inline constexpr std::size_t kMaxAliases = 32;
+inline constexpr std::size_t kMaxPacketBytes = 160;
+inline constexpr std::size_t kMaxRxPerTick = 32;
+
+inline constexpr float kNominalEnduranceS = 7.0f * 3600.0f;  // 7 h combustion endurance
+
+// Tunables. Defaults are illustrative; flight values come from the mission
+// data load and must be validated in flight test.
+struct MeshConfig {
+  // ---- timing
+  std::uint32_t heartbeat_period_ms = 1000;
+  std::uint32_t peer_timeout_ms = 5000;
+  std::uint32_t anti_entropy_period_ms = 2000;
+  std::uint32_t coordination_period_ms = 500;
+  std::uint32_t observation_max_age_ms = 90000;
+  std::uint32_t verify_timeout_ms = 600000;
+  std::uint32_t slot_adopt_grace_ms = 2500;
+  std::uint32_t alert_backup_delay_ms = 3000;
+  std::uint32_t max_antientropy_per_cycle = 16;
+
+  // ---- association and fusion
+  double association_gate_m = 500.0;
+  double association_cep_factor = 1.5;
+  double bearing_gate_deg = 2.0;       // added to 3*sigma when gating a bearing
+  double min_geometry_eigen = 0.03;    // ~14 deg crossing angle for two lines
+  double min_bearing_sigma_deg = 0.5;
+  double provisional_range_m = 15000.0;  // assumed range for a lone bearing
+  double provisional_cep_m = 8000.0;
+  double single_modality_conf_cap = 0.85;
+  double multi_modality_conf_cap = 0.99;
+  double unlocalized_conf_cap = 0.5;
+
+  // ---- urgency and tasking
+  double benign_novelty = 0.2;
+  double urgency_decay_ms = 60000.0;
+  float min_task_urgency = 0.25f;
+  float dual_verifier_urgency = 0.6f;
+  double max_diversion_fraction = 0.4;  // of drones free to be tasked
+  float hysteresis_bonus = 0.15f;
+  // Re-issue a task to the FCS only if the target estimate moved by more than
+  // max(retask_move_m, retask_cep_factor * target CEP): noise-level movement of
+  // the fused position must not make the FCS chase it.
+  double retask_move_m = 500.0;
+  double retask_cep_factor = 3.0;
+
+  // suitability weights (sum to 1)
+  float w_eta = 0.40f;
+  float w_sensor = 0.25f;
+  float w_fuel = 0.15f;
+  float w_diversity = 0.20f;
+  double eta_ref_s = 1200.0;
+  double fuel_ref_s = 3600.0;
+  double verify_dwell_s = 300.0;
+  double min_speed_mps = 20.0;
+  double standoff_m = 6000.0;
+  double max_detour_m = 60000.0;
+
+  // GMCS-approved corridor. Circular geofence; 0 radius disables the check.
+  GeoPoint geofence_center{};
+  double geofence_radius_m = 0.0;
+
+  // ---- alerting
+  double advisory_min_severity = 0.7;
+  double advisory_min_conf = 0.6;
+  double advisory_max_cep_m = 2000.0;
+  double priority_min_conf = 0.9;
+  double priority_max_cep_m = 250.0;
+  unsigned priority_min_observers = 2;
+  unsigned priority_min_modalities = 2;
+};
+
+}  // namespace amc8270::mesh

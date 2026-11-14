@@ -1,0 +1,443 @@
+<title>Model 8270 Pack Mesh</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+/* Layout: one reading column on a cool instrument-panel ground; teal is the mesh, amber is the detection, as in the storyboard.
+   Condensed signage face for headings, plain sans for text, mono for interfaces and code. */
+:root {
+  --bg: #eef2f5;
+  --surface: #ffffff;
+  --surface-2: #e5ebf0;
+  --fg: #0f1d26;
+  --fg-2: #455968;
+  --line: #cfd9e0;
+  --teal: #007f86;
+  --teal-ink: #00656b;
+  --teal-soft: rgba(0, 127, 134, 0.12);
+  --amber: #b86e00;
+  --amber-ink: #8a5200;
+  --amber-soft: rgba(184, 110, 0, 0.16);
+  --bad: #b3261e;
+  --code-bg: #0e1a22;
+  --code-fg: #dbe7ee;
+  --code-dim: #8fa5b3;
+  --font-display: 'Barlow Condensed', 'Arial Narrow', 'Helvetica Neue', Arial, sans-serif;
+  --font-body: 'IBM Plex Sans', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0b1318; --surface: #111c23; --surface-2: #182630; --fg: #e5eef3; --fg-2: #9ab0bf; --line: #263944;
+    --teal: #4fd1d6; --teal-ink: #5fdde2; --teal-soft: rgba(79, 209, 214, 0.14);
+    --amber: #f3b04a; --amber-ink: #f5bb62; --amber-soft: rgba(243, 176, 74, 0.18);
+    --bad: #ff8a80; --code-bg: #070e13; --code-fg: #d6e3eb; --code-dim: #7f97a6;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0b1318; --surface: #111c23; --surface-2: #182630; --fg: #e5eef3; --fg-2: #9ab0bf; --line: #263944;
+  --teal: #4fd1d6; --teal-ink: #5fdde2; --teal-soft: rgba(79, 209, 214, 0.14);
+  --amber: #f3b04a; --amber-ink: #f5bb62; --amber-soft: rgba(243, 176, 74, 0.18);
+  --bad: #ff8a80; --code-bg: #070e13; --code-fg: #d6e3eb; --code-dim: #7f97a6;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; scroll-padding-top: 64px; }
+body {
+  background: var(--bg); color: var(--fg);
+  font-family: var(--font-body); font-size: 16px; line-height: 1.6;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 56px;
+}
+body::before { content: ""; position: fixed; inset: 0 0 auto; height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--bg); }
+.wrap { max-width: 1080px; margin: 0 auto; }
+a { color: var(--teal-ink); }
+code, pre, .mono { font-family: var(--font-mono); }
+code { font-size: 0.9em; background: var(--surface-2); padding: 0.1em 0.35em; border-radius: 3px; }
+h1, h2, h3 { font-family: var(--font-display); font-weight: 700; line-height: 1.08; text-wrap: balance; margin: 0; }
+h2 { font-size: clamp(30px, 4.4vw, 42px); letter-spacing: 0.005em; }
+h3 { font-size: 22px; font-weight: 600; letter-spacing: 0.01em; }
+p { margin: 0; }
+.label { font-size: 12px; font-weight: 600; letter-spacing: 0.12em; text-transform: uppercase; color: var(--fg-2); }
+
+/* header */
+header.top { padding-block: 40px 28px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; }
+header.top h1 { font-size: clamp(46px, 9vw, 84px); letter-spacing: 0.005em; }
+.lede { font-size: clamp(18px, 2.4vw, 22px); max-width: 46ch; color: var(--fg); line-height: 1.45; }
+.facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); margin-top: 8px; }
+.fact { padding: 14px 18px 14px 0; display: grid; gap: 2px; align-content: start; }
+.fact b { font-family: var(--font-display); font-size: 30px; font-weight: 700; line-height: 1.1; }
+.fact span { font-size: 14px; color: var(--fg-2); line-height: 1.4; }
+.fact .amber { color: var(--amber-ink); }
+.fact .teal { color: var(--teal-ink); }
+.src-note { font-size: 13px; color: var(--fg-2); }
+
+/* nav */
+nav.sections { position: sticky; top: env(safe-area-inset-top, 0px); z-index: 20; background: var(--bg); border-bottom: 1px solid var(--line); margin-inline: calc(-1 * max(16px, env(safe-area-inset-left, 0px))); padding-inline: max(16px, env(safe-area-inset-left, 0px)); }
+nav.sections ul { list-style: none; display: flex; gap: 22px; margin: 0 auto; padding: 0; max-width: 1080px; overflow-x: auto; white-space: nowrap; }
+nav.sections a { display: block; padding: 12px 0; text-decoration: none; color: var(--fg-2); font-size: 14px; font-weight: 500; border-bottom: 2px solid transparent; }
+nav.sections a:hover, nav.sections a:focus-visible { color: var(--fg); border-bottom-color: var(--teal); outline: none; }
+
+/* sections */
+section { padding-block: 52px 8px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 22px; }
+section > * { min-width: 0; }
+section > .intro { max-width: 62ch; color: var(--fg-2); }
+.tablewrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: 14.5px; }
+th, td { text-align: left; padding: 10px 14px; vertical-align: top; border-bottom: 1px solid var(--line); }
+tr:last-child td { border-bottom: 0; }
+th { font-size: 12px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; color: var(--fg-2); background: var(--surface-2); }
+td.k { font-weight: 600; white-space: nowrap; }
+td.num, th.num { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.compare td:nth-child(2) { color: var(--fg-2); }
+.compare td:nth-child(3) { color: var(--fg); }
+.caps { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 18px 28px; }
+.caps div { border-top: 2px solid var(--teal); padding-top: 10px; display: grid; gap: 4px; align-content: start; }
+.caps h3 { font-size: 20px; }
+.caps p { font-size: 15px; color: var(--fg-2); }
+
+/* scenario */
+.scenario { display: grid; grid-template-columns: minmax(0, 440px) minmax(0, 1fr); gap: 28px; align-items: start; }
+.mapbox { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 6px; }
+svg.map { display: block; width: 100%; height: auto; }
+svg.map .mesh { stroke: var(--teal); stroke-width: 2.4; opacity: 0.5; }
+svg.map .route { stroke: var(--fg-2); stroke-width: 1.5; marker-end: none; }
+svg.map .bearing { stroke: var(--amber); stroke-width: 1.3; opacity: 0.9; }
+svg.map .oor { stroke: var(--fg-2); stroke-width: 1.1; stroke-dasharray: 4 5; opacity: 0.7; }
+svg.map .path { stroke: var(--teal); stroke-width: 2; stroke-dasharray: 7 5; }
+svg.map .ring { fill: none; stroke: var(--teal); stroke-width: 1.2; stroke-dasharray: 3 6; }
+svg.map .cep { fill: var(--amber-soft); stroke: var(--amber); stroke-width: 1.3; }
+svg.map .src { fill: var(--amber); }
+svg.map .stand { fill: var(--surface); stroke: var(--teal); stroke-width: 2.2; }
+svg.map .emit { fill: none; stroke: var(--fg-2); stroke-width: 1.6; }
+svg.map .lost line { stroke: var(--bad); stroke-width: 2.6; stroke-linecap: round; }
+svg.map .uav circle { fill: var(--teal); stroke: var(--surface); stroke-width: 2; }
+svg.map .uav.op circle { fill: var(--surface); stroke: var(--fg); stroke-width: 3.2; }
+svg.map .uav.low circle { stroke: var(--amber); stroke-width: 3.2; }
+svg.map .scale { stroke: var(--fg-2); stroke-width: 1.5; fill: none; }
+svg.map text { font-family: var(--font-body); }
+svg.map .lbl { fill: var(--fg); font-size: 14px; font-weight: 600; }
+svg.map .note { fill: var(--fg-2); font-size: 12.5px; }
+.legend { display: grid; gap: 8px; font-size: 14px; color: var(--fg-2); margin-top: 14px; list-style: none; padding: 0; }
+.legend li { display: grid; grid-template-columns: 34px 1fr; gap: 10px; align-items: center; }
+.legend svg { width: 34px; height: 14px; overflow: visible; }
+.timeline td:first-child { font-family: var(--font-mono); font-size: 13.5px; white-space: nowrap; color: var(--teal-ink); font-variant-numeric: tabular-nums; }
+
+/* storyboard */
+.panels { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 18px; }
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 18px 20px 20px; display: grid; gap: 8px; align-content: start; }
+.panel .n { font-family: var(--font-mono); font-size: 12.5px; color: var(--teal-ink); letter-spacing: 0.06em; }
+.panel h3 { font-size: 24px; }
+.panel p { color: var(--fg-2); font-size: 15px; }
+.panel .vis { font-size: 14px; color: var(--fg-2); border-left: 2px solid var(--line); padding-left: 12px; }
+.chip { justify-self: start; font-family: var(--font-mono); font-size: 12.5px; background: var(--amber-soft); color: var(--amber-ink); padding: 3px 9px; border-radius: 4px; margin-top: 4px; }
+
+/* hardware */
+.rules { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 18px 28px; }
+.rules div { display: grid; gap: 4px; align-content: start; }
+.rules b { font-family: var(--font-display); font-size: 20px; font-weight: 600; }
+.rules span { color: var(--fg-2); font-size: 15px; }
+.diagram { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 12px; overflow-x: auto; }
+.diagram pre.mermaid { margin: 0; min-width: 760px; text-align: center; font-family: var(--font-body); }
+pre.ascii { margin: 0; background: var(--code-bg); color: var(--code-fg); border-radius: 8px; padding: 16px; font-size: 12px; line-height: 1.25; overflow-x: auto; }
+td.id { font-family: var(--font-mono); font-size: 13px; color: var(--teal-ink); white-space: nowrap; }
+td.bus { font-family: var(--font-mono); font-size: 13px; }
+
+/* algorithm */
+.steps { counter-reset: s; list-style: none; padding: 0; margin: 0; display: grid; gap: 14px; max-width: 74ch; }
+.steps li { counter-increment: s; display: grid; grid-template-columns: 34px 1fr; gap: 14px; }
+.steps li::before { content: counter(s); font-family: var(--font-display); font-weight: 700; font-size: 22px; line-height: 1.2; color: var(--teal-ink); border-bottom: 2px solid var(--teal); align-self: start; text-align: center; padding-bottom: 2px; }
+.steps b { font-weight: 600; }
+.formula { background: var(--code-bg); color: var(--code-fg); border-radius: 8px; padding: 14px 16px; font-size: 13.5px; line-height: 1.7; overflow-x: auto; margin: 0; }
+.formula .dim { color: var(--code-dim); }
+.two { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 22px; }
+.two > div { display: grid; gap: 10px; align-content: start; min-width: 0; }
+
+/* code */
+details.code { border: 1px solid var(--line); border-radius: 8px; background: var(--surface); min-width: 0; max-width: 100%; }
+details.code summary { cursor: pointer; padding: 12px 16px; font-weight: 600; font-size: 15px; list-style-position: inside; overflow-wrap: anywhere; }
+details.code summary .path { font-family: var(--font-mono); font-weight: 400; font-size: 13px; color: var(--fg-2); margin-left: 8px; overflow-wrap: anywhere; word-break: break-all; }
+details.code summary:focus-visible, button.copy:focus-visible { outline: 2px solid var(--teal); outline-offset: 2px; }
+details.code pre { margin: 0; background: var(--code-bg); color: var(--code-fg); padding: 16px; font-size: 12.5px; line-height: 1.5; overflow-x: auto; border-radius: 0 0 8px 8px; }
+
+/* prompts */
+.copyblock { border: 1px solid var(--line); border-radius: 8px; background: var(--surface); overflow: hidden; }
+.cb-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 8px 8px 16px; background: var(--surface-2); font-size: 13px; font-weight: 600; }
+button.copy { font: 600 13px var(--font-body); color: var(--fg); background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 6px 14px; cursor: pointer; }
+button.copy:hover { border-color: var(--teal); color: var(--teal-ink); }
+pre.prompt { margin: 0; padding: 14px 16px; white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--font-body); font-size: 14.5px; line-height: 1.55; }
+.colors { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px 18px; font-size: 14px; color: var(--fg-2); }
+.colors span { display: grid; grid-template-columns: 22px 1fr; gap: 10px; align-items: center; }
+.colors i { display: block; height: 4px; border-radius: 2px; }
+
+/* open items */
+.open { display: grid; gap: 0; max-width: 78ch; padding: 0; margin: 0; list-style: none; border-top: 1px solid var(--line); }
+.open li { padding: 12px 0; border-bottom: 1px solid var(--line); display: grid; gap: 2px; }
+.open b { font-weight: 600; }
+.open span { color: var(--fg-2); font-size: 15px; }
+footer { margin-top: 56px; padding-top: 16px; border-top: 1px solid var(--line); font-size: 13.5px; color: var(--fg-2); display: grid; gap: 4px; }
+
+@media (max-width: 820px) {
+  .scenario { grid-template-columns: minmax(0, 1fr); }
+  section { padding-block-start: 40px; }
+  td.k { white-space: normal; }
+}
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+</style>
+
+<div class="wrap">
+  <header class="top">
+    <div class="label">Airborne Mission Computer Model 8270</div>
+    <h1>Pack mesh</h1>
+    <p class="lede">Six aircraft, one operator, and now all six are working. A peer-to-peer mesh lets every drone share what its sensors see and decide, with no leader, which of them should verify a detection.</p>
+    <div class="facts" aria-label="Results from the simulated scenario">
+      <div class="fact"><b class="amber">20.1 s</b><span>Early-warning ADVISORY sent. Five drones triangulated the source to a 708 m CEP.</span></div>
+      <div class="fact"><b class="teal">328 s</b><span>Verified PRIORITY alert sent: two sensor types agree, CEP 70 m.</span></div>
+      <div class="fact"><b>1.7 kbit/s</b><span>Mean mesh traffic per drone; 3.7 kbit/s at the peak second.</span></div>
+      <div class="fact"><b>0 allocations</b><span>On the heap in the mesh loop, checked by test. 29 tests, 409 checks pass, also under ASan and UBSan.</span></div>
+    </div>
+    <p class="src-note">Figures come from a software simulation of the mesh logic (<code>make sim</code>), not from flight tests.</p>
+  </header>
+
+  <nav class="sections" aria-label="Sections">
+    <ul>
+      <li><a href="#idea">Baseline vs mesh</a></li>
+      <li><a href="#scenario">Scenario</a></li>
+      <li><a href="#storyboard">Storyboard</a></li>
+      <li><a href="#hardware">Hardware</a></li>
+      <li><a href="#algorithm">Algorithm</a></li>
+      <li><a href="#code">Code</a></li>
+      <li><a href="#prompts">Image prompts</a></li>
+      <li><a href="#open">Not done yet</a></li>
+    </ul>
+  </nav>
+
+  <section id="idea">
+    <h2>Baseline versus mesh</h2>
+    <p class="intro">The GMCS can route the whole pack but can actively control one drone in mission mode. The other drones carry sensors and a mission computer and use neither. With the mesh, those drones scan, share and nominate verifiers on their own. The operator keeps full control of the one drone they fly.</p>
+    <div class="tablewrap">
+      <table class="compare">
+        <thead><tr><th>Aspect</th><th>Baseline: one drone at a time</th><th>Mesh-enabled pack</th></tr></thead>
+        <tbody>
+          <tr><td class="k">Sensor suites contributing</td><td>1 of 6</td><td>All 6 share readings; 5 of 6 can also be tasked. The controlled drone never is.</td></tr>
+          <tr><td class="k">Where detections come from</td><td>Wherever the controlled drone happens to be</td><td>Anywhere along a front tens of kilometres wide</td></tr>
+          <tr><td class="k">Locating an RF source</td><td>Operator flies one drone along a baseline</td><td>Several bearings arrive at once. No drone leaves formation.</td></tr>
+          <tr><td class="k">Verifying a detection</td><td>One drone, one angle, after the operator re-tasks it</td><td>Best-placed drones, different angles, different sensor types</td></tr>
+          <tr><td class="k">Operator workload</td><td>Detect, decide, re-task, interpret, report</td><td>One advisory, one verified alert, optional dismissal. In the scenario, zero actions to reach PRIORITY.</td></tr>
+          <tr><td class="k">What reaches the GMCS</td><td>Raw data from one drone</td><td>Fused, de-duplicated alerts</td></tr>
+          <tr><td class="k">Loss of a drone</td><td>Operator notices and re-plans</td><td>Peer times out after 5 s and its task is re-assigned (4.6 s in the scenario)</td></tr>
+          <tr><td class="k">Dependence on the C2 link</td><td>Total</td><td>Only alerts need a link, and any drone with a link can send them</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="caps">
+      <div><h3>Wide-area scanning</h3><p>Every drone keeps its direction-finder and imagers running on the route and files each reading with the pack.</p></div>
+      <div><h3>Cooperative triangulation</h3><p>Bearings from several drones intersect by weighted least squares. Near-parallel geometry is rejected.</p></div>
+      <div><h3>Autonomous prioritisation</h3><p>Every event gets an urgency from class, novelty, confidence and freshness. All drones compute the same ranking.</p></div>
+      <div><h3>Shared learning</h3><p>An operator dismissal of a benign emitter reaches every drone, and the drone checking it is released.</p></div>
+      <div><h3>Verification and alerting</h3><p>The best-placed drones approach from different angles. Two sensor types must agree before a PRIORITY alert.</p></div>
+    </div>
+  </section>
+
+  <section id="scenario">
+    <h2>The simulated scenario</h2>
+    <p class="intro">Six drones fly east in a line 10 km apart. D1 is under operator control, D5 is almost out of fuel. The map is drawn to scale from the simulation's own coordinates at the moment a distress beacon switches on.</p>
+    <div class="scenario">
+      <div>
+        <div class="mapbox">{{MAP}}</div>
+        <ul class="legend">
+          <li><svg viewBox="0 0 34 14"><line x1="0" y1="7" x2="34" y2="7" stroke="var(--teal)" stroke-width="2.4" opacity="0.5"/></svg>Mesh links between drones</li>
+          <li><svg viewBox="0 0 34 14"><line x1="0" y1="7" x2="34" y2="7" stroke="var(--amber)" stroke-width="1.5"/></svg>Direction-finding bearings, five drones</li>
+          <li><svg viewBox="0 0 34 14"><line x1="0" y1="7" x2="34" y2="7" stroke="var(--teal)" stroke-width="2" stroke-dasharray="7 5"/></svg>Paths of the two nominated verifiers</li>
+          <li><svg viewBox="0 0 34 14"><circle cx="17" cy="7" r="6" fill="var(--amber-soft)" stroke="var(--amber)" stroke-width="1.3"/></svg>Position uncertainty (CEP 708 m, to scale)</li>
+          <li><svg viewBox="0 0 34 14"><circle cx="17" cy="7" r="5.5" fill="var(--surface)" stroke="var(--fg)" stroke-width="3"/></svg>D1: operator-controlled, shares readings, never tasked</li>
+          <li><svg viewBox="0 0 34 14"><circle cx="17" cy="7" r="5.5" fill="var(--teal)" stroke="var(--amber)" stroke-width="3"/></svg>D5: near bingo fuel, contributes bearings, never diverted</li>
+          <li><svg viewBox="0 0 34 14"><circle cx="17" cy="7" r="5" fill="var(--surface)" stroke="var(--teal)" stroke-width="2.2"/></svg>Standoff points, 6 km from the source on a dashed ring</li>
+        </ul>
+      </div>
+      <div style="display:grid;gap:14px;min-width:0">
+        <h3>What happens, second by second</h3>
+        <div class="tablewrap">
+          <table class="timeline">
+            <tbody>
+              <tr><td>10 s</td><td>Pre-briefed weather radio detected; urgency 0.09, ignored.</td></tr>
+              <tr><td>20.0 s</td><td>Beacon switches on. Five drones hear it. D1 is 36 km away, out of range.</td></tr>
+              <tr><td>20.1 s</td><td>Bearings shared and triangulated, CEP 708 m. <b>ADVISORY</b> sent by D4 over LEO SATCOM (it has no LOS). D4 and D6 nominated, from the east and the north. D5, second-nearest, is excluded for fuel.</td></tr>
+              <tr><td>90 s</td><td>Fault injected: D4 is lost.</td></tr>
+              <tr><td>94.6 s</td><td>D6 takes the primary role. With one drone fewer the diversion budget allows one verifier.</td></tr>
+              <tr><td>100 s</td><td>Novel ISM emitter appears (urgency 0.45). It waits behind the beacon.</td></tr>
+              <tr><td>304 s</td><td>D6 closes to 10 km. IR fixes arrive and the FCS is re-pointed twice as the estimate improves.</td></tr>
+              <tr><td>328 s</td><td>Two sensor types agree: CEP 70 m, actual error 28 m. <b>PRIORITY</b> sent over LOS. D6 released.</td></tr>
+              <tr><td>420 s</td><td>Operator dismisses the ISM emitter through D1. Every drone learns it; D2, sent to check it, is released.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="src-note">The five minutes between the two alerts is flight time. The mesh does not shorten the transit. It starts the right drones at once, from a position estimate good to under a kilometre, and informs the operator meanwhile.</p>
+        <h3>Is the position estimate honest?</h3>
+        <p style="color:var(--fg-2);font-size:15px">A 20,000-trial Monte Carlo at 2.5 degrees of bearing error shows about half of fixes fall inside the reported CEP, as a CEP should (49.9 to 51.5 per cent). Poor geometry has heavy tails: 2 to 6 per cent of fixes are more than three times the CEP off. That is fine for an early warning and is why PRIORITY needs a second sensor type.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="storyboard">
+    <h2>Marketing storyboard</h2>
+    <p class="intro">Six panels that work as one hero image, a six-slide build or a thumbnail row. The aircraft are unarmed: a sensor turret under the nose and nothing on the wings. Callouts come from the simulation, so label them as simulated on any slide.</p>
+    <div class="colors" aria-label="Colour language">
+      <span><i style="background:var(--teal)"></i>Mesh link, drone to drone</span>
+      <span><i style="background:var(--amber)"></i>Detection bearing and uncertainty</span>
+      <span><i style="background:var(--fg)"></i>Verified alert, white in the artwork</span>
+      <span><i style="background:var(--fg-2)"></i>Operator-controlled drone, one warm-white ring</span>
+    </div>
+    <div class="panels">
+      <article class="panel"><span class="n">PANEL 1</span><h3>One operator. One working sensor.</h3><p>Today, only one aircraft is on the job. The rest fly the route with their sensors and processors idle.</p><p class="vis">Six UAVs line abreast over open terrain, one with a bright ring, five dimmed, a faint route line ahead.</p><span class="chip">1 of 6 sensor suites in use</span></article>
+      <article class="panel"><span class="n">PANEL 2</span><h3>The mesh wakes the pack</h3><p>Every aircraft listens and shares. Peer-to-peer links, run by the Model 8270 on each drone, turn route-flyers into a distributed sensor.</p><p class="vis">Teal halos, thin teal arcs between neighbours with packet dots, a faint sensor sweep under each aircraft.</p><span class="chip">6 of 6 sensor suites contributing</span></article>
+      <article class="panel"><span class="n">PANEL 3</span><h3>One hears it. All of them know.</h3><p>The first bearing is shared in the next mesh cycle. No operator in the loop yet.</p><p class="vis">An amber glow on the ground at a forest edge. One sweep clips it and an amber line draws down.</p><span class="chip">Shared within one 0.1 s mesh cycle (simulated)</span></article>
+      <article class="panel"><span class="n">PANEL 4</span><h3>Five drones triangulate what one could only hear</h3><p>Bearing-only readings from several vantage points fuse into a position with no drone leaving formation.</p><p class="vis">Four more amber lines converge. A translucent ellipse tightens around the glow.</p><span class="chip">5 observers, CEP 0.7 km, early warning sent</span></article>
+      <article class="panel"><span class="n">PANEL 5</span><h3>The pack decides who goes. The rest keep watching.</h3><p>Chosen by time to target, sensor type, fuel margin and viewing angle. At most two fifths of the pack ever leave the route.</p><p class="vis">Two aircraft bank away on different headings; the others fly on. One carries a small fuel icon.</p><span class="chip">2 verifiers, different angles, 3 keep scanning</span></article>
+      <article class="panel"><span class="n">PANEL 6</span><h3>The operator gets an answer, not a stream.</h3><p>Two sensor types confirm the position. One compact alert goes up over the best available link.</p><p class="vis">The ellipse collapses to a dot. A white packet climbs to LEO, then GEO, then down to a ground control centre.</p><span class="chip">PRIORITY alert, CEP 70 m, 1.7 kbit/s mean mesh load</span></article>
+    </div>
+  </section>
+
+  <section id="hardware">
+    <h2>Hardware block diagram</h2>
+    <p class="intro">The Model 8270 sits at the centre. This is a recommended architecture, not a confirmed 8270 interface control document.</p>
+    <div class="rules">
+      <div><b>The operator's path bypasses the mesh</b><span>C2 terminals reach the FCS directly. A hung or hostile mesh cannot block flight commands.</span></div>
+      <div><b>The AMC asks, the FCS decides</b><span>Verification tasks are requests. The FCS enforces the corridor and can refuse or revert.</span></div>
+      <div><b>One time base</b><span>1 PPS and time of day from the INS/GNSS discipline the AMC clock, which stamps all mesh traffic.</span></div>
+    </div>
+    <div class="diagram"><pre class="mermaid">{{MERMAID}}</pre></div>
+    <h3>ASCII version</h3>
+    <pre class="ascii" tabindex="0" aria-label="ASCII hardware block diagram">{{ASCII}}</pre>
+    <h3>Interfaces</h3>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>ID</th><th>Link</th><th>Bus</th><th>Carries</th></tr></thead>
+        <tbody>
+          <tr><td class="id">I1</td><td>Mesh transceiver and AMC</td><td class="bus">Gigabit Ethernet, UDP multicast</td><td>Mesh frames, 160 bytes at most</td></tr>
+          <tr><td class="id">I2</td><td>AMC time service to mesh radio</td><td class="bus">1 PPS, RS-422</td><td>Time pulse for slot timing</td></tr>
+          <tr><td class="id">I4</td><td>LOS, LEO, GEO terminals and AMC</td><td class="bus">Gigabit Ethernet</td><td>Alerts, mission data, downlinked imagery</td></tr>
+          <tr><td class="id">I5</td><td>C2 terminals to FCS</td><td class="bus">RS-422, dual</td><td><b>Flight commands, direct, not through the AMC</b></td></tr>
+          <tr><td class="id">I6</td><td>AMC and C2 terminals</td><td class="bus">RS-422 / RS-485</td><td>Link state, antenna control, active-link selection</td></tr>
+          <tr><td class="id">I7</td><td>RF direction-finder and AMC</td><td class="bus">Gigabit Ethernet</td><td>Bearing reports; IQ on demand</td></tr>
+          <tr><td class="id">I8</td><td>EO/IR gimbal and AMC</td><td class="bus">Gigabit Ethernet, RS-422</td><td>Video, geolocated fixes, cueing</td></tr>
+          <tr><td class="id">I9</td><td>Anomaly detectors and AMC</td><td class="bus">CAN 2.0B or RS-485</td><td>Events, status</td></tr>
+          <tr><td class="id">I10</td><td>Payload power unit and AMC</td><td class="bus">CAN 2.0B</td><td>Power state, faults, on/off commands</td></tr>
+          <tr><td class="id">I11</td><td>AMC and FCS</td><td class="bus">RS-422, dual (1553B optional)</td><td>Requests and cancels one way; mode, corridor, accept or refuse, health the other</td></tr>
+          <tr><td class="id">I12</td><td>INS/GNSS to AMC and FCS</td><td class="bus">RS-422, 100 to 200 Hz</td><td>Position, velocity, attitude</td></tr>
+          <tr><td class="id">I13</td><td>INS/GNSS to AMC time service</td><td class="bus">1 PPS + time of day</td><td>UTC time base</td></tr>
+          <tr><td class="id">I14</td><td>EMU and FCS</td><td class="bus">CAN 2.0B / CANaerospace</td><td>Engine control and status</td></tr>
+          <tr><td class="id">I15</td><td>EMU to AMC</td><td class="bus">CAN 2.0B, listen-only</td><td>Fuel flow and quantity, giving the endurance against the 7 h nominal</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="algorithm">
+    <h2>How the pack decides</h2>
+    <p class="intro">No leader. Every drone folds the same readings into the same table and computes the same plan. Drones with the same table agree without negotiating.</p>
+    <ol class="steps">
+      <li><span><b>Share.</b> Each drone broadcasts a heartbeat at 1 Hz (position, fuel, active sensor, mode, task) and each sensor reading as it happens. Own readings are re-sent every 2 s so a lost packet only delays convergence.</span></li>
+      <li><span><b>Fuse.</b> Readings are keyed by observer and sensor and kept in sorted order. Bearings intersect into a position; duplicate events merge into the lowest id.</span></li>
+      <li><span><b>Rank.</b> <code>evaluateAndCoordinateAlerts()</code> runs every 0.5 s on every drone and ranks events by urgency.</span></li>
+      <li><span><b>Nominate.</b> For each event the best-fitting free drones are chosen. A drone that finds itself in the plan sends a request to the FCS and claims its slot on the mesh. Claims are arbitrated by score, ties by lowest id.</span></li>
+      <li><span><b>Alert.</b> ADVISORY once an event is localised well enough, PRIORITY once two sensor types agree. One drone is the owner, with ranked backups. The GMCS also de-duplicates by event id.</span></li>
+    </ol>
+    <div class="two">
+      <div>
+        <h3>Urgency and fit</h3>
+<pre class="formula">urgency = severity(class) x novelty
+        x (0.3 + 0.7 x confidence)
+        x (0.5 + 0.5 x freshness)
+
+fit = 0.40 x time to standoff
+    + 0.25 x new sensor type
+    + 0.15 x fuel margin
+    + 0.20 x viewing-angle spread
+    <span class="dim">+ 0.15 if already the verifier</span></pre>
+        <div class="tablewrap"><table>
+          <thead><tr><th>Class</th><th class="num">Severity</th></tr></thead>
+          <tbody><tr><td>Distress beacon</td><td class="num">1.0</td></tr><tr><td>Thermal hazard</td><td class="num">0.9</td></tr><tr><td>Anomaly</td><td class="num">0.7</td></tr><tr><td>Unclassified RF emitter</td><td class="num">0.5</td></tr><tr><td>Unknown</td><td class="num">0.4</td></tr></tbody>
+        </table></div>
+      </div>
+      <div>
+        <h3>Hard limits and alert levels</h3>
+<pre class="formula">eligible:  PACK_ROUTING only
+           (ACTIVE_MISSION, RTB never)
+fuel:      endurance - bingo
+           - (2 x ETA + 300 s) >= 0
+corridor:  standoff inside the approved area
+budget:    at most floor(0.4 x free drones),
+           minimum 1
+verifiers: 2 if urgency >= 0.6, else 1
+
+ADVISORY:  severity >= 0.7, confidence >= 0.6,
+           CEP <= 2 km
+PRIORITY:  confidence >= 0.9, CEP <= 250 m,
+           >= 2 observers, >= 2 sensor types</pre>
+        <p style="color:var(--fg-2);font-size:15px">Confidence is a noisy-OR of the readings, capped at 0.85 for one sensor type and 0.99 for two or more. A single sensor type can never confirm an event.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="code">
+    <h2>Embedded C++17</h2>
+    <p class="intro">Flight-library rules: no exceptions or RTTI, no heap allocation after construction, bounded loops, explicit little-endian wire format. <code>make audit</code> fails the build if the library uses <code>new</code>, <code>throw</code>, <code>std::vector</code> and similar. One <code>PackMeshManager</code> is about 60 KB of fixed storage.</p>
+    <details class="code" open><summary>evaluateAndCoordinateAlerts<span class="path">src/pack_mesh_manager.cpp</span></summary><pre>{{CODE_EVAL}}</pre></details>
+    <details class="code"><summary>DroneState<span class="path">include/amc8270/mesh/drone_state.hpp</span></summary><pre>{{CODE_STATE}}</pre></details>
+    <details class="code"><summary>DetectedEvent<span class="path">include/amc8270/mesh/detected_event.hpp</span></summary><pre>{{CODE_EVENT}}</pre></details>
+    <details class="code"><summary>MeshPacket<span class="path">include/amc8270/mesh/mesh_packet.hpp</span></summary><pre>{{CODE_PACKET}}</pre></details>
+  </section>
+
+  <section id="prompts">
+    <h2>Image prompts</h2>
+    <p class="intro">Generate the picture without text and add the labels in your slide tool, since image models garble small lettering. If the mesh links come out heavy, add "thin hairline links, low opacity". If the drones come out as quadcopters, repeat "fixed-wing, slender long wing".</p>
+    {{PROMPT_MASTER}}
+    {{PROMPT_NEG}}
+    {{PROMPT_MJ}}
+    {{PROMPT_SHORT}}
+  </section>
+
+  <section id="open">
+    <h2>Not done yet</h2>
+    <p class="intro">Read these before relying on any of this.</p>
+    <ul class="open">
+      <li><b>No authentication or encryption.</b><span>Packets carry a CRC, which catches accidents but not an attacker. A real mesh needs authenticated encryption, key management and replay protection.</span></li>
+      <li><b>No flight validation.</b><span>Every performance figure comes from a simulation with idealised sensors, zero radio latency and a range limited only by distance.</span></li>
+      <li><b>The 8270's real interfaces are assumed.</b><span>All hardware access goes through one abstraction layer. The buses in the diagram are recommendations.</span></li>
+      <li><b>The FCS interface has no reply.</b><span>A real one needs accept and refuse.</span></li>
+      <li><b>Time assumes a shared GNSS-disciplined clock.</b><span>GNSS-denied operation is not handled.</span></li>
+      <li><b>The corridor is a circle.</b><span>A real approved corridor is a polygon.</span></li>
+      <li><b>Mesh partitions are untested.</b><span>Each side of a split keeps working by design and the GMCS de-duplicates alerts, but no test covers it.</span></li>
+    </ul>
+    <footer>
+      <span>The system detects, localises, verifies and alerts. It has no weapons or engagement logic and does not command flight controls: it sends requests to the FCS.</span>
+      <span>Repository: <code>drones-mesh/</code> with docs, <code>include/</code>, <code>src/</code>, <code>tests/</code> and <code>sim/</code>.</span>
+    </footer>
+  </section>
+</div>
+
+<script>
+(function () {
+  var buttons = document.querySelectorAll('button.copy');
+  buttons.forEach(function (b) {
+    b.addEventListener('click', function () {
+      var el = document.getElementById(b.getAttribute('data-target'));
+      if (!el) return;
+      var done = function (msg) { b.textContent = msg; setTimeout(function () { b.textContent = 'Copy'; }, 2200); };
+      var fallback = function () {
+        var r = document.createRange(); r.selectNodeContents(el);
+        var s = window.getSelection(); s.removeAllRanges(); s.addRange(r);
+        done('Selected, press Ctrl+C');
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(el.textContent).then(function () { done('Copied'); }, fallback);
+      } else { fallback(); }
+    });
+  });
+})();
+</script>
+{{LOCAL_MERMAID}}

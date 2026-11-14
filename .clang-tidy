@@ -1,0 +1,23 @@
+# Gate for the flight library (include/ + src/). CI fails on any finding.
+# Style-only checks that fight fixed-capacity, index-based embedded code are off.
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  cert-*,
+  clang-analyzer-*,
+  cppcoreguidelines-special-member-functions,
+  cppcoreguidelines-slicing,
+  cppcoreguidelines-virtual-class-destructor,
+  cppcoreguidelines-narrowing-conversions,
+  misc-redundant-expression,
+  misc-unused-parameters,
+  performance-*,
+  readability-redundant-member-init,
+  readability-redundant-casting,
+  readability-misleading-indentation
+WarningsAsErrors: '*'
+HeaderFilterRegex: 'include/amc8270/.*'
+CheckOptions:
+  - key: cppcoreguidelines-narrowing-conversions.WarnOnFloatingPointNarrowingConversion
+    value: false

@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: build + test (${{ matrix.os }}, ${{ matrix.cxx }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, cxx: g++ }
+          - { os: ubuntu-latest, cxx: clang++ }
+          - { os: macos-latest, cxx: clang++ }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit tests
+        run: make CXX=${{ matrix.cxx }} test
+      - name: Scenario simulation
+        run: make CXX=${{ matrix.cxx }} sim
+      - name: Simulation is deterministic
+        run: |
+          ./build/pack_sim > run1.txt
+          ./build/pack_sim > run2.txt
+          diff run1.txt run2.txt
+      - name: Flight-library audit
+        run: make audit
+
+  sanitizers:
+    name: ASan + UBSan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tests and simulation under sanitizers
+        run: make CXX=clang++ check
+
+  cmake:
+    name: CMake build + ctest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build-cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo
+      - name: Build
+        run: cmake --build build-cmake --parallel
+      - name: Test
+        run: ctest --test-dir build-cmake --output-on-failure
+
+  static-analysis:
+    name: clang-tidy + cppcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cppcheck
+          pip install --user clang-tidy==23.1.4
+      - name: Compilation database
+        run: cmake -S . -B build-cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+      - name: clang-tidy (config in .clang-tidy, warnings are errors)
+        run: |
+          for f in src/*.cpp; do
+            echo "::group::$f"
+            clang-tidy -quiet -p build-cmake "$f"
+            echo "::endgroup::"
+          done
+      - name: cppcheck
+        run: |
+          cppcheck --std=c++17 --language=c++ --enable=warning,performance,portability \
+            --inline-suppr --suppress=missingIncludeSystem --error-exitcode=1 \
+            -Iinclude src include
