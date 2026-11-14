@@ -170,6 +170,9 @@ Memory: one `PackMeshManager` is about 60 KB of fixed storage, allocated once. N
 | Low fuel | Excluded by the fuel rule; it still contributes readings | Yes |
 | Alert owner has no link, or the send fails | Retried each cycle; the next-ranked drone takes over after 3 s | Yes |
 | Mesh partition | Each side keeps working from its own table; both sides may alert for the same event; the GMCS de-duplicates by event id | By design; not tested |
+| Two sources on the same frequency | Fused only if their positions or bearings agree; a shared frequency alone is not enough | Yes |
+| Packet naming another drone as its source, future timestamp, absurd values | Rejected on receipt and counted | Yes |
+| Clock stepped backwards (GNSS correction) | Periodic messages keep flowing | Yes |
 | Same source filed under two ids | Merged into the lowest id; old id kept as an alias | Yes |
 | Table full | Lowest-urgency event without a verifier is evicted | Yes |
 | FCS refuses a task | Not modelled: the request interface returns nothing; a real interface needs an accept/reject reply | Open |

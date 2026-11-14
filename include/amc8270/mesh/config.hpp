@@ -18,6 +18,12 @@ inline constexpr std::size_t kMaxRxPerTick = 32;
 
 inline constexpr float kNominalEnduranceS = 7.0f * 3600.0f;  // 7 h combustion endurance
 
+// Capacity relationships the code relies on.
+static_assert(kMaxEvents <= 256, "event order arrays index events with std::uint8_t");
+static_assert(kMaxObsPerEvent <= 255, "DetectedEvent::observer_count is std::uint8_t");
+static_assert(kMaxPackSize >= 2 && kMaxPackSize <= 0xFFFF, "a pack needs >= 2 drones; DroneId is 16-bit");
+static_assert(kMaxPacketBytes <= 0xFFFF, "the payload length field is 16-bit");
+
 // Tunables. Defaults are illustrative; flight values come from the mission
 // data load and must be validated in flight test.
 struct MeshConfig {
@@ -31,6 +37,9 @@ struct MeshConfig {
   std::uint32_t slot_adopt_grace_ms = 2500;
   std::uint32_t alert_backup_delay_ms = 3000;
   std::uint32_t max_antientropy_per_cycle = 16;
+  // Readings or states stamped further than this in the future are rejected:
+  // a far-future stamp would otherwise never age out and could never be replaced.
+  std::uint32_t max_clock_skew_ms = 2000;
 
   // ---- association and fusion
   double association_gate_m = 500.0;

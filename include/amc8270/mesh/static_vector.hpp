@@ -3,6 +3,7 @@
 #pragma once
 
 #include <array>
+#include <cassert>
 #include <cstddef>
 
 namespace amc8270::mesh {
@@ -16,8 +17,9 @@ class StaticVector {
   bool full() const noexcept { return size_ == N; }
   void clear() noexcept { size_ = 0; }
 
-  // Returns false (and stores nothing) when full.
-  bool push_back(const T& v) noexcept {
+  // Returns false (and stores nothing) when full. Callers must handle that:
+  // silently losing data at a capacity limit is exactly the bug to avoid.
+  [[nodiscard]] bool push_back(const T& v) noexcept {
     if (size_ >= N) return false;
     data_[size_++] = v;
     return true;
@@ -30,8 +32,14 @@ class StaticVector {
     --size_;
   }
 
-  T& operator[](std::size_t i) noexcept { return data_[i]; }
-  const T& operator[](std::size_t i) const noexcept { return data_[i]; }
+  T& operator[](std::size_t i) noexcept {
+    assert(i < size_);
+    return data_[i];
+  }
+  const T& operator[](std::size_t i) const noexcept {
+    assert(i < size_);
+    return data_[i];
+  }
 
   T* begin() noexcept { return data_.data(); }
   T* end() noexcept { return data_.data() + size_; }

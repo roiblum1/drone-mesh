@@ -4,6 +4,8 @@
 #include <cmath>
 #include <cstring>
 
+#include "amc8270/mesh/validation.hpp"
+
 namespace amc8270::mesh {
 
 namespace {
@@ -168,6 +170,7 @@ void readState(Reader& r, DroneState& s) {
   }
   s.mode = static_cast<DroneMode>(mode);
   s.active_sensor = static_cast<SensorType>(sensor);
+  if (!isPlausible(s)) r.fail();
 }
 
 void writeObservation(Writer& w, const SensorObservation& o) {
@@ -209,6 +212,7 @@ void readObservation(Reader& r, SensorObservation& o) {
   o.sensor = static_cast<SensorType>(sensor);
   o.class_hint = static_cast<EventClass>(cls);
   o.has_fix = has_fix == 1;
+  if (!isPlausible(o)) r.fail();
 }
 
 }  // namespace
@@ -284,7 +288,7 @@ bool decodePacket(const std::uint8_t* buf, std::size_t len, MeshPacket& out) noe
   h.seq = head.u32();
   h.time_ms = head.u64();
   if (!head.ok() || magic != kPacketMagic || version != kPacketVersion || h.src == kNoDrone) return false;
-  if (type < 1 || type > 6) return false;
+  if (type < 1 || type > kMsgTypeMax) return false;
   if (static_cast<std::size_t>(payload_len) + kHeaderBytes + kCrcBytes != len) return false;
 
   Reader tail(buf + kHeaderBytes + payload_len, kCrcBytes);
@@ -310,7 +314,9 @@ bool decodePacket(const std::uint8_t* buf, std::size_t len, MeshPacket& out) noe
       p.claimant = r.u16();
       p.role = r.u8();
       p.score = r.f32();
-      if (p.role > 1 || p.claimant == kNoDrone || p.event_id == kNoEvent) return false;
+      if (p.role > 1 || p.claimant == kNoDrone || p.event_id == kNoEvent || !isPlausibleClaimScore(p.score)) {
+        return false;
+      }
       break;
     }
     case MsgType::ALERT_ISSUED: {
@@ -318,6 +324,7 @@ bool decodePacket(const std::uint8_t* buf, std::size_t len, MeshPacket& out) noe
       p.event_id = r.u32();
       const std::uint8_t level = r.u8();
       p.issuer = r.u16();
+      if (p.issuer == kNoDrone) return false;
       if (level == 0 || level > kAlertLevelMax || p.event_id == kNoEvent) return false;
       p.level = static_cast<AlertLevel>(level);
       break;

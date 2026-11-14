@@ -13,7 +13,8 @@ struct Vec2 {
   double n = 0.0;  // north, metres
 };
 
-double wrap360(double deg) noexcept;
+double wrap360(double deg) noexcept;  // [0, 360)
+double wrap180(double deg) noexcept;  // [-180, 180)
 double angleDiffDeg(double a, double b) noexcept;  // smallest difference, 0..180
 double distanceM(const GeoPoint& a, const GeoPoint& b) noexcept;
 double bearingDeg(const GeoPoint& from, const GeoPoint& to) noexcept;  // [0,360)
@@ -48,7 +49,7 @@ struct TriangulationResult {
 // (cross-range error grows with distance). Rejects fewer than two lines,
 // near-parallel geometry (smallest eigenvalue of sum(n n^T) below
 // min_geometry_eigen) and fixes that fall behind an observer.
-bool triangulate(const BearingLine* lines, std::size_t count, double min_geometry_eigen,
+[[nodiscard]] bool triangulate(const BearingLine* lines, std::size_t count, double min_geometry_eigen,
                  TriangulationResult& out) noexcept;
 
 }  // namespace amc8270::mesh

@@ -91,6 +91,15 @@ constexpr float eventSeverity(EventClass c) noexcept {
   return 0.4f;
 }
 
+// Milliseconds from `then` to `now`; 0 if `now` is earlier (clock stepped back).
+constexpr TimeMs elapsedMs(TimeMs now, TimeMs then) noexcept { return now > then ? now - then : 0; }
+
+// True when a periodic action is due. A backwards clock step counts as due,
+// so a GNSS time correction can never silence the drone.
+constexpr bool isDue(TimeMs now, TimeMs last, TimeMs period) noexcept {
+  return now < last || now - last >= period;
+}
+
 struct GeoPoint {
   double lat_deg = 0.0;  // WGS-84
   double lon_deg = 0.0;

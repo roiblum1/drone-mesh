@@ -1,6 +1,5 @@
 #pragma once
 
-#include "amc8270/mesh/config.hpp"
 #include "amc8270/mesh/types.hpp"
 
 namespace amc8270::mesh {

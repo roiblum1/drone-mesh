@@ -197,7 +197,7 @@ footer { margin-top: 56px; padding-top: 16px; border-top: 1px solid var(--line);
       <div class="fact"><b class="amber">20.1 s</b><span>Early-warning ADVISORY sent. Five drones triangulated the source to a 708 m CEP.</span></div>
       <div class="fact"><b class="teal">328 s</b><span>Verified PRIORITY alert sent: two sensor types agree, CEP 70 m.</span></div>
       <div class="fact"><b>1.7 kbit/s</b><span>Mean mesh traffic per drone; 3.7 kbit/s at the peak second.</span></div>
-      <div class="fact"><b>0 allocations</b><span>On the heap in the mesh loop, checked by test. 29 tests, 409 checks pass, also under ASan and UBSan.</span></div>
+      <div class="fact"><b>0 allocations</b><span>On the heap in the mesh loop, checked by test. 40 tests, 635 checks pass, also under ASan and UBSan.</span></div>
     </div>
     <p class="src-note">Figures come from a software simulation of the mesh logic (<code>make sim</code>), not from flight tests.</p>
   </header>
@@ -487,7 +487,7 @@ footer { margin-top: 56px; padding-top: 16px; border-top: 1px solid var(--line);
       <li><span><b>Share.</b> Each drone broadcasts a heartbeat at 1 Hz (position, fuel, active sensor, mode, task) and each sensor reading as it happens. Own readings are re-sent every 2 s so a lost packet only delays convergence.</span></li>
       <li><span><b>Fuse.</b> Readings are keyed by observer and sensor and kept in sorted order. Bearings intersect into a position; duplicate events merge into the lowest id.</span></li>
       <li><span><b>Rank.</b> <code>evaluateAndCoordinateAlerts()</code> runs every 0.5 s on every drone and ranks events by urgency.</span></li>
-      <li><span><b>Nominate.</b> For each event the best-fitting free drones are chosen. A drone that finds itself in the plan sends a request to the FCS and claims its slot on the mesh. Claims are arbitrated by score, ties by lowest id.</span></li>
+      <li><span><b>Nominate.</b> For each event the best-fitting free drones are chosen. A drone that finds itself in the plan sends a request to the FCS and claims its slot on the mesh. Claims are arbitrated by quantised score, ties by lowest id, so the holder never depends on arrival order.</span></li>
       <li><span><b>Alert.</b> ADVISORY once an event is localised well enough, PRIORITY once two sensor types agree. One drone is the owner, with ranked backups. The GMCS also de-duplicates by event id.</span></li>
     </ol>
     <div class="two">
@@ -629,6 +629,7 @@ struct MeshPacket {
       <li><b>The FCS interface has no reply.</b><span>A real one needs accept and refuse.</span></li>
       <li><b>Time assumes a shared GNSS-disciplined clock.</b><span>GNSS-denied operation is not handled.</span></li>
       <li><b>The corridor is a circle.</b><span>A real approved corridor is a polygon.</span></li>
+      <li><b>Forged packets.</b><span>Packets naming another drone as sender, future timestamps and absurd values are rejected, but a forged frequency dismissal or alert notice still works without authentication.</span></li>
       <li><b>Mesh partitions are untested.</b><span>Each side of a split keeps working by design and the GMCS de-duplicates alerts, but no test covers it.</span></li>
     </ul>
     <footer>

@@ -33,12 +33,18 @@ using DroneList = StaticVector<DroneState, kMaxPackSize>;
 class SituationalAwarenessTable {
  public:
   SituationalAwarenessTable(DroneId self, const MeshConfig& cfg) noexcept;
+  // ~60 KB of state with internal ids and aliases: never copied by accident.
+  SituationalAwarenessTable(const SituationalAwarenessTable&) = delete;
+  SituationalAwarenessTable& operator=(const SituationalAwarenessTable&) = delete;
+  SituationalAwarenessTable(SituationalAwarenessTable&&) = delete;
+  SituationalAwarenessTable& operator=(SituationalAwarenessTable&&) = delete;
+  ~SituationalAwarenessTable() = default;
 
   // ---- pack membership -------------------------------------------------
   void setSelf(const DroneState& st) noexcept;
   const DroneState& self() const noexcept { return self_; }
   // Creates or updates a peer from a HEARTBEAT. True if newly discovered.
-  bool updatePeer(const DroneState& st, std::uint32_t seq, TimeMs now) noexcept;
+  [[nodiscard]] bool updatePeer(const DroneState& st, std::uint32_t seq, TimeMs now) noexcept;
   // Liveness + loss accounting for any other packet from a known peer.
   void notePacket(DroneId src, std::uint32_t seq, TimeMs now) noexcept;
   std::size_t expirePeers(TimeMs now) noexcept;  // returns how many were dropped
@@ -49,7 +55,10 @@ class SituationalAwarenessTable {
   void snapshotDrones(DroneList& out) const noexcept;      // self + peers
 
   // ---- events ----------------------------------------------------------
-  EventId allocateEventId() noexcept;
+  // Fresh event id, never one already in use. Seed the counter once per boot
+  // (e.g. from the clock) so ids from before a restart are not handed out again.
+  [[nodiscard]] EventId allocateEventId() noexcept;
+  void seedEventCounter(std::uint16_t seed) noexcept;
   EventId resolve(EventId id) const noexcept;  // follows merge/rename aliases
   const DetectedEvent* findEvent(EventId id) const noexcept;
   DetectedEvent* findEvent(EventId id) noexcept;
@@ -57,22 +66,22 @@ class SituationalAwarenessTable {
   StaticVector<DetectedEvent, kMaxEvents>& mutableEvents() noexcept { return events_; }
 
   // Which existing event this observation belongs to (kNoEvent if none).
-  EventId associate(const SensorObservation& obs) const noexcept;
+  [[nodiscard]] EventId associate(const SensorObservation& obs) const noexcept;
   // Stores the observation, creating/merging events as needed. Returns the
   // canonical event id, or kNoEvent if it had to be dropped.
-  EventId ingestObservation(const SensorObservation& obs, TimeMs now) noexcept;
+  [[nodiscard]] EventId ingestObservation(const SensorObservation& obs, TimeMs now) noexcept;
 
   // Prune, re-fuse, merge duplicates, validate verifier slots, update status.
   void refresh(TimeMs now) noexcept;
 
-  ClaimResult applyClaim(EventId event, DroneId claimant, std::uint8_t role, float score,
+  [[nodiscard]] ClaimResult applyClaim(EventId event, DroneId claimant, std::uint8_t role, float score,
                          TimeMs now) noexcept;
   void markAlertSent(EventId event, AlertLevel level) noexcept;
 
   // ---- learned environment ---------------------------------------------
   // `learned` signatures are re-broadcast by anti-entropy; preloaded ones are
   // identical on every drone (mission data) and are not.
-  bool markBenign(std::uint32_t signature, bool learned) noexcept;
+  [[nodiscard]] bool markBenign(std::uint32_t signature, bool learned) noexcept;
   bool isBenign(std::uint32_t signature) const noexcept;
   std::size_t learnedCount() const noexcept;
   std::uint32_t learnedAt(std::size_t i) const noexcept;
@@ -93,6 +102,8 @@ class SituationalAwarenessTable {
   void addAlias(EventId from, EventId to) noexcept;
   void rename(EventId from, EventId to) noexcept;
   bool shouldMerge(const DetectedEvent& a, const DetectedEvent& b) const noexcept;
+  bool gatePasses(const SensorObservation& o, const DetectedEvent& ev, double& metric) const noexcept;
+  bool idInUse(EventId id) const noexcept;
   void mergeDuplicates() noexcept;
   void validateSlots(DetectedEvent& ev, TimeMs now) const noexcept;
   bool evictOne() noexcept;
@@ -102,7 +113,7 @@ class SituationalAwarenessTable {
   MeshConfig cfg_;
   DroneState self_{};
   std::uint16_t event_counter_ = 0;
-  StaticVector<PeerRecord, kMaxPackSize> peers_{};
+  StaticVector<PeerRecord, kMaxPackSize - 1> peers_{};  // + self = kMaxPackSize = DroneList capacity
   StaticVector<DetectedEvent, kMaxEvents> events_{};
   StaticVector<Alias, kMaxAliases> aliases_{};
   StaticVector<BenignSig, kMaxKnownSignatures> benign_{};

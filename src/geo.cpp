@@ -19,6 +19,13 @@ constexpr double kMinRangeM = 200.0;  // floor on range used for weighting
 double wrap360(double deg) noexcept {
   double d = std::fmod(deg, 360.0);
   if (d < 0.0) d += 360.0;
+  if (d >= 360.0) d -= 360.0;  // -1e-15 + 360 rounds to 360.0
+  return d;
+}
+
+double wrap180(double deg) noexcept {
+  double d = wrap360(deg + 180.0) - 180.0;
+  if (d < -180.0) d += 360.0;
   return d;
 }
 
@@ -52,7 +59,8 @@ GeoPoint destinationPoint(const GeoPoint& from, double bearing_deg, double dista
   const double brg = bearing_deg * kDeg2Rad;
   const double p1 = from.lat_deg * kDeg2Rad;
   const double l1 = from.lon_deg * kDeg2Rad;
-  const double p2 = std::asin(std::sin(p1) * std::cos(ang) + std::cos(p1) * std::sin(ang) * std::cos(brg));
+  const double s2 = std::sin(p1) * std::cos(ang) + std::cos(p1) * std::sin(ang) * std::cos(brg);
+  const double p2 = std::asin(std::min(1.0, std::max(-1.0, s2)));  // rounding can leave |s2| > 1
   const double l2 = l1 + std::atan2(std::sin(brg) * std::sin(ang) * std::cos(p1),
                                     std::cos(ang) - std::sin(p1) * std::sin(p2));
   GeoPoint out;
@@ -65,11 +73,12 @@ GeoPoint destinationPoint(const GeoPoint& from, double bearing_deg, double dista
 LocalFrame::LocalFrame(const GeoPoint& origin) noexcept
     : origin_(origin),
       m_per_deg_lat_(kEarthRadiusM * kDeg2Rad),
-      m_per_deg_lon_(kEarthRadiusM * kDeg2Rad * std::cos(origin.lat_deg * kDeg2Rad)) {}
+      // Clamp near the poles so fromEnu() never divides by ~0.
+      m_per_deg_lon_(kEarthRadiusM * kDeg2Rad * std::max(std::cos(origin.lat_deg * kDeg2Rad), 1.0e-6)) {}
 
 Vec2 LocalFrame::toEnu(const GeoPoint& p) const noexcept {
   Vec2 v;
-  v.e = (p.lon_deg - origin_.lon_deg) * m_per_deg_lon_;
+  v.e = wrap180(p.lon_deg - origin_.lon_deg) * m_per_deg_lon_;  // safe across the antimeridian
   v.n = (p.lat_deg - origin_.lat_deg) * m_per_deg_lat_;
   return v;
 }
@@ -77,7 +86,7 @@ Vec2 LocalFrame::toEnu(const GeoPoint& p) const noexcept {
 GeoPoint LocalFrame::fromEnu(const Vec2& v, float alt_m) const noexcept {
   GeoPoint p;
   p.lat_deg = origin_.lat_deg + v.n / m_per_deg_lat_;
-  p.lon_deg = origin_.lon_deg + v.e / m_per_deg_lon_;
+  p.lon_deg = wrap180(origin_.lon_deg + v.e / m_per_deg_lon_);
   p.alt_m = alt_m;
   return p;
 }

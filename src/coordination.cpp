@@ -15,8 +15,6 @@ constexpr double kApproachStepDeg = 30.0;
 constexpr double kApproachTieDeg = 15.0;  // prefer the candidate nearest the drone within this of the best
 constexpr double kDiversityRefDeg = 90.0;
 
-TimeMs elapsed(TimeMs now, TimeMs then) noexcept { return now > then ? now - then : 0; }
-
 float clamp01(double v) noexcept { return static_cast<float>(std::min(1.0, std::max(0.0, v))); }
 
 SensorType chooseSensor(const DroneState& d, const DetectedEvent& ev) noexcept {
@@ -37,7 +35,7 @@ float computeUrgency(const DetectedEvent& ev, bool benign, TimeMs now, const Mes
   const double sev = static_cast<double>(eventSeverity(ev.cls));
   const double novelty = benign ? cfg.benign_novelty : 1.0;
   const double conf = static_cast<double>(clamp01(ev.confidence));
-  const double age = static_cast<double>(elapsed(now, ev.last_update_ms));
+  const double age = static_cast<double>(elapsedMs(now, ev.last_update_ms));
   const double fresh = static_cast<double>(clamp01(1.0 - age / cfg.urgency_decay_ms));
   return static_cast<float>(sev * novelty * (0.3 + 0.7 * conf) * (0.5 + 0.5 * fresh));
 }
@@ -56,7 +54,7 @@ bool isTaskable(const DroneState& d) noexcept {
 bool eligibleForTasking(const DetectedEvent& ev, TimeMs now, const MeshConfig& cfg) noexcept {
   if (ev.status == EventStatus::DISMISSED || ev.status == EventStatus::CONFIRMED || ev.priority_sent) return false;
   if (ev.urgency < cfg.min_task_urgency) return false;
-  if (ev.verify_started_ms != 0 && elapsed(now, ev.verify_started_ms) > cfg.verify_timeout_ms) return false;
+  if (ev.verify_started_ms != 0 && elapsedMs(now, ev.verify_started_ms) > cfg.verify_timeout_ms) return false;
   return true;
 }
 
@@ -209,7 +207,7 @@ void planAssignments(const SituationalAwarenessTable& table, const DroneList& dr
       a.approach_bearing_deg = best_s.approach_bearing_deg;
       a.sensor_to_cue = best_s.sensor_to_cue;
       a.urgency = ev.urgency;
-      out.push_back(a);
+      (void)out.push_back(a);  // cannot fail: one assignment per drone, out holds kMaxPackSize
     }
   }
 }
@@ -233,7 +231,16 @@ void applyAssignments(SituationalAwarenessTable& table, const AssignmentList& pl
         ev.verifier[s] = VerifierSlot{mine[s]->drone, mine[s]->score, now};
       }
     }
-    if (any && ev.verify_started_ms == 0) ev.verify_started_ms = now;
+    // The verification clock runs per tenure: it restarts when every current
+    // verifier is new (e.g. after the previous one was lost), and stops
+    // counting nothing once no drone holds a slot.
+    if (any) {
+      TimeMs earliest = now;
+      for (const auto& slot : ev.verifier) {
+        if (slot.id != kNoDrone && slot.since_ms < earliest) earliest = slot.since_ms;
+      }
+      ev.verify_started_ms = earliest;
+    }
   }
 }
 
@@ -259,7 +266,7 @@ int alertOwnerRank(const SituationalAwarenessTable& table, const DetectedEvent& 
     for (const DroneId e : order) {
       if (e == id) return;
     }
-    order.push_back(id);
+    (void)order.push_back(id);  // cannot fail: capacity is 2 slots + all observers + all drones
   };
   add(ev.verifier[0].id);
   add(ev.verifier[1].id);

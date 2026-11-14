@@ -18,7 +18,8 @@ namespace amc8270::mesh {
 struct MeshStats {
   std::uint32_t tx_packets = 0;
   std::uint32_t rx_packets = 0;
-  std::uint32_t rx_rejected = 0;  // bad CRC / framing / range
+  std::uint32_t rx_rejected = 0;     // bad CRC / framing / range / sender mismatch
+  std::uint32_t local_rejected = 0;  // implausible input from this drone's own avionics
   std::uint32_t peers_discovered = 0;
   std::uint32_t peers_lost = 0;
   std::uint32_t observations_sent = 0;
@@ -34,8 +35,14 @@ struct MeshStats {
 
 class PackMeshManager {
  public:
+  // `cfg` must satisfy isValid(cfg) (validation.hpp); check it before constructing.
   PackMeshManager(DroneId self, const MeshConfig& cfg, IClock& clock, IMeshTransceiver& radio, IGmcsLink& gmcs,
                   IGuidanceSink& guidance) noexcept;
+  PackMeshManager(const PackMeshManager&) = delete;
+  PackMeshManager& operator=(const PackMeshManager&) = delete;
+  PackMeshManager(PackMeshManager&&) = delete;
+  PackMeshManager& operator=(PackMeshManager&&) = delete;
+  ~PackMeshManager() = default;
 
   // ---- inputs from the rest of the avionics ----------------------------
   // Own state from FCS / INS-GNSS / EMU / C2 link manager. `mode` is the
@@ -44,7 +51,7 @@ class PackMeshManager {
   void updateOwnState(const DroneState& state) noexcept;
   // A reading from the homing/detection sensor bus. Fills observer, position
   // and event association; broadcasts it to the pack. False if dropped.
-  bool reportLocalDetection(SensorObservation obs) noexcept;
+  [[nodiscard]] bool reportLocalDetection(SensorObservation obs) noexcept;
   // Operator declared a signature benign: learned locally and shared.
   void applyGmcsDismissal(std::uint32_t signature) noexcept;
   // Mission-data signature known to all drones (not re-broadcast).
@@ -67,7 +74,7 @@ class PackMeshManager {
 
  private:
   template <typename Payload>
-  bool broadcast(const Payload& payload, TimeMs now) noexcept;
+  [[nodiscard]] bool broadcast(const Payload& payload, TimeMs now) noexcept;
 
   void receiveAll(TimeMs now) noexcept;
   void handlePacket(const MeshPacket& pkt, TimeMs now) noexcept;
@@ -94,6 +101,7 @@ class PackMeshManager {
   TimeMs last_anti_entropy_ms_ = 0;
   TimeMs last_eval_ms_ = 0;
   TimeMs last_claim_ms_ = 0;
+  std::uint32_t ae_cursor_ = 0;  // rotating start of the anti-entropy re-send
   bool heartbeat_requested_ = false;
   MeshStats stats_{};
 };

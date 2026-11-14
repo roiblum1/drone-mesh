@@ -47,7 +47,7 @@ struct Suitability {
   float fuel_margin_s = 0.0f;
   SensorType sensor_to_cue = SensorType::NONE;
 };
-bool computeSuitability(const DroneState& d, const DetectedEvent& ev, const double* covered_azimuths_deg,
+[[nodiscard]] bool computeSuitability(const DroneState& d, const DetectedEvent& ev, const double* covered_azimuths_deg,
                         std::size_t n_covered, bool incumbent, const MeshConfig& cfg,
                         Suitability& out) noexcept;
 

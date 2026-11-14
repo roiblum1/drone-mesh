@@ -12,7 +12,8 @@ add_library(amc8270_mesh STATIC
   src/geo.cpp
   src/mesh_packet.cpp
   src/pack_mesh_manager.cpp
-  src/situational_awareness.cpp)
+  src/situational_awareness.cpp
+  src/validation.cpp)
 target_include_directories(amc8270_mesh PUBLIC include)
 # Flight-library rules: no exceptions, no RTTI.
 target_compile_options(amc8270_mesh PUBLIC -fno-exceptions -fno-rtti)

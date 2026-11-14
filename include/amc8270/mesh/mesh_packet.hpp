@@ -31,6 +31,7 @@ enum class MsgType : std::uint8_t {
   SIGNATURE_UPDATE = 5,  // GMCS-taught benign signature
   LEAVE = 6,
 };
+inline constexpr std::uint8_t kMsgTypeMax = 6;
 
 struct HeartbeatPayload {
   DroneState state{};
@@ -70,12 +71,15 @@ struct MeshPacket {
   MsgType type() const noexcept { return static_cast<MsgType>(payload.index()); }
 };
 
-std::uint32_t crc32(const std::uint8_t* data, std::size_t len) noexcept;
+// Largest encoded frame is an OBSERVATION: 20 + 61 + 4 = 85 bytes.
+static_assert(kHeaderBytes + 61 + kCrcBytes <= kMaxPacketBytes, "kMaxPacketBytes must hold an OBSERVATION frame");
+
+[[nodiscard]] std::uint32_t crc32(const std::uint8_t* data, std::size_t len) noexcept;
 
 // Returns the encoded size, or 0 if the packet is empty or does not fit.
-std::size_t encodePacket(const MeshPacket& pkt, std::uint8_t* buf, std::size_t cap) noexcept;
+[[nodiscard]] std::size_t encodePacket(const MeshPacket& pkt, std::uint8_t* buf, std::size_t cap) noexcept;
 
 // False on any framing, CRC, range or finiteness violation; `out` is then unspecified.
-bool decodePacket(const std::uint8_t* buf, std::size_t len, MeshPacket& out) noexcept;
+[[nodiscard]] bool decodePacket(const std::uint8_t* buf, std::size_t len, MeshPacket& out) noexcept;
 
 }  // namespace amc8270::mesh

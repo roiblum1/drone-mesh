@@ -341,7 +341,7 @@ void sampleSensors(SimDrone& d, Rng& rng) {
       o.bearing_sigma_deg = static_cast<float>(kDfSigmaDeg);
       o.confidence = 0.5f;
       o.signature = e.sig;
-      d.mgr->reportLocalDetection(o);
+      (void)d.mgr->reportLocalDetection(o);  // false = implausible reading, counted in stats
     }
 
     if (!e.thermal) continue;
@@ -357,7 +357,7 @@ void sampleSensors(SimDrone& d, Rng& rng) {
       o.fix_cep_m = 70.0f;
       o.confidence = s == SensorType::IR ? 0.8f : 0.7f;
       o.observer_position = here;
-      d.mgr->reportLocalDetection(o);
+      (void)d.mgr->reportLocalDetection(o);  // false = implausible reading, counted in stats
     }
   }
 }

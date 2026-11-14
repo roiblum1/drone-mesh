@@ -61,7 +61,7 @@ check: $(SAN)/mesh_tests $(SAN)/pack_sim
 BANNED := \b(new|delete|malloc|calloc|realloc|free|throw|try|catch|dynamic_cast|typeid)\b|std::(vector|string|map|unordered_map|list|deque|function|shared_ptr|unique_ptr|make_unique|make_shared)
 audit:
 	@bad=0; for f in $(HDRS) $(LIB_SRCS); do \
-	  hits=$$(sed -e 's://.*$$::' $$f | grep -nE '$(BANNED)' || true); \
+	  hits=$$(sed -e 's://.*$$::' -e 's/= *delete//g' $$f | grep -nE '$(BANNED)' || true); \
 	  if [ -n "$$hits" ]; then echo "$$f:"; echo "$$hits"; bad=1; fi; \
 	done; \
 	if [ $$bad -eq 0 ]; then echo "audit: flight library clean"; else echo "audit: banned construct found"; exit 1; fi

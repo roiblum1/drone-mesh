@@ -5,6 +5,7 @@
 #include <cmath>
 
 #include "amc8270/mesh/geo.hpp"
+#include "amc8270/mesh/validation.hpp"
 
 namespace amc8270::mesh {
 
@@ -13,8 +14,6 @@ namespace {
 constexpr double kDeg2Rad = 3.14159265358979323846 / 180.0;
 constexpr double kRad2Deg = 180.0 / 3.14159265358979323846;
 constexpr double kCepPerSigma = 1.1774;  // CEP = 1.1774 sigma for an isotropic 2-D Gaussian
-
-TimeMs elapsed(TimeMs now, TimeMs then) noexcept { return now > then ? now - then : 0; }
 
 bool obsKeyLess(const SensorObservation& a, const SensorObservation& b) noexcept {
   if (a.observer != b.observer) return a.observer < b.observer;
@@ -46,7 +45,7 @@ bool insertObservation(DetectedEvent& ev, const SensorObservation& o) noexcept {
     if (!obsOlder(ev.observations[oldest], o)) return false;  // newcomer is the oldest
     ev.observations.erase_at(oldest);
   }
-  ev.observations.push_back(o);
+  if (!ev.observations.push_back(o)) return false;  // cannot fail: a full list had its oldest erased above
   std::size_t i = ev.observations.size() - 1;
   while (i > 0 && obsKeyLess(ev.observations[i], ev.observations[i - 1])) {
     const SensorObservation tmp = ev.observations[i];
@@ -85,14 +84,21 @@ void absorb(DetectedEvent& k, const DetectedEvent& d) noexcept {
   if (d.status == EventStatus::DISMISSED) k.status = EventStatus::DISMISSED;
 }
 
+constexpr double kUngatedMetric = 1.0e12;  // ranks signature-only matches after geometric ones
+
+std::int64_t quantiseScore(float s) noexcept { return std::llround(static_cast<double>(s) * 1.0e4); }
+
+constexpr std::uint32_t kSeqRestartWindow = 1000U;  // a jump larger than this is a restart, not loss
+
 bool trackSeq(PeerRecord& p, std::uint32_t seq) noexcept {
   if (seq > p.last_seq) {
-    p.missed_count += seq - p.last_seq - 1;
+    const std::uint32_t gap = seq - p.last_seq - 1U;
+    if (gap <= kSeqRestartWindow) p.missed_count += gap;  // huge jumps would wreck the statistic
     p.last_seq = seq;
     ++p.rx_count;
     return true;
   }
-  if (p.last_seq - seq > 1000u) {  // sender restarted
+  if (p.last_seq - seq > kSeqRestartWindow) {  // sender restarted
     p.last_seq = seq;
     ++p.rx_count;
     return true;
@@ -116,8 +122,10 @@ void fuseEvent(DetectedEvent& ev, const MeshConfig& cfg) noexcept {
   EventClass cls = EventClass::UNKNOWN;
   double miss = 1.0;  // product of (1 - c): noisy-OR across independent readings
   double lat_sum = 0.0;
-  double lon_sum = 0.0;
+  double dlon_sum = 0.0;  // longitudes relative to ref_lon, unwrapped across the antimeridian
   double pos_n = 0.0;
+  const double ref_lon = ev.observations[0].observer_position.lon_deg;
+  std::uint32_t signature = 0;  // re-derived each time so every drone agrees
   DroneId last_observer = kNoDrone;
   for (const auto& o : ev.observations) {
     ev.modality_mask = static_cast<SensorMask>(ev.modality_mask | maskOf(o.sensor));
@@ -130,20 +138,21 @@ void fuseEvent(DetectedEvent& ev, const MeshConfig& cfg) noexcept {
     if (sev_o > sev_c || (sev_o == sev_c && o.class_hint > cls)) cls = o.class_hint;
     miss *= 1.0 - std::min(0.99, std::max(0.0, static_cast<double>(o.confidence)));
     lat_sum += o.observer_position.lat_deg;
-    lon_sum += o.observer_position.lon_deg;
+    dlon_sum += wrap180(o.observer_position.lon_deg - ref_lon);
     pos_n += 1.0;
     if (o.has_fix) {
       lat_sum += o.fix.lat_deg;
-      lon_sum += o.fix.lon_deg;
+      dlon_sum += wrap180(o.fix.lon_deg - ref_lon);
       pos_n += 1.0;
     }
-    if (ev.signature == 0 && o.signature != 0) ev.signature = o.signature;
+    if (signature == 0 && o.signature != 0) signature = o.signature;
   }
   ev.cls = cls;
+  ev.signature = signature;
 
   GeoPoint origin;
   origin.lat_deg = lat_sum / pos_n;
-  origin.lon_deg = lon_sum / pos_n;
+  origin.lon_deg = wrap180(ref_lon + dlon_sum / pos_n);
   const LocalFrame frame(origin);
 
   struct Estimate {
@@ -220,7 +229,8 @@ void SituationalAwarenessTable::setSelf(const DroneState& st) noexcept {
 }
 
 bool SituationalAwarenessTable::updatePeer(const DroneState& st, std::uint32_t seq, TimeMs now) noexcept {
-  if (st.id == kNoDrone || st.id == self_id_) return false;
+  if (st.id == kNoDrone || st.id == self_id_ || !isPlausible(st)) return false;
+  if (st.timestamp_ms > now + cfg_.max_clock_skew_ms) return false;
   for (auto& p : peers_) {
     if (p.state.id != st.id) continue;
     p.last_heard_ms = now;
@@ -233,8 +243,7 @@ bool SituationalAwarenessTable::updatePeer(const DroneState& st, std::uint32_t s
   r.last_heard_ms = now;
   r.last_seq = seq;
   r.rx_count = 1;
-  peers_.push_back(r);
-  return true;
+  return peers_.push_back(r);
 }
 
 void SituationalAwarenessTable::notePacket(DroneId src, std::uint32_t seq, TimeMs now) noexcept {
@@ -249,7 +258,7 @@ void SituationalAwarenessTable::notePacket(DroneId src, std::uint32_t seq, TimeM
 std::size_t SituationalAwarenessTable::expirePeers(TimeMs now) noexcept {
   std::size_t dropped = 0;
   for (std::size_t i = peers_.size(); i-- > 0;) {
-    if (elapsed(now, peers_[i].last_heard_ms) > cfg_.peer_timeout_ms) {
+    if (elapsedMs(now, peers_[i].last_heard_ms) > cfg_.peer_timeout_ms) {
       peers_.erase_at(i);
       ++dropped;
     }
@@ -282,8 +291,9 @@ const DroneState* SituationalAwarenessTable::findDrone(DroneId id) const noexcep
 
 void SituationalAwarenessTable::snapshotDrones(DroneList& out) const noexcept {
   out.clear();
-  out.push_back(self_);
-  for (const auto& p : peers_) out.push_back(p.state);
+  // Cannot fail: peers_ holds kMaxPackSize - 1, so self + peers fit DroneList exactly.
+  (void)out.push_back(self_);
+  for (const auto& p : peers_) (void)out.push_back(p.state);
   // Sort by id so every drone iterates the pack in the same order.
   for (std::size_t i = 1; i < out.size(); ++i) {
     std::size_t j = i;
@@ -298,10 +308,25 @@ void SituationalAwarenessTable::snapshotDrones(DroneList& out) const noexcept {
 
 // ---------------------------------------------------------------- events
 
+void SituationalAwarenessTable::seedEventCounter(std::uint16_t seed) noexcept { event_counter_ = seed; }
+
+bool SituationalAwarenessTable::idInUse(EventId id) const noexcept {
+  if (findEvent(id) != nullptr) return true;
+  for (const auto& a : aliases_) {
+    if (a.from == id || a.to == id) return true;
+  }
+  return false;
+}
+
 EventId SituationalAwarenessTable::allocateEventId() noexcept {
-  ++event_counter_;
-  if (event_counter_ == 0) event_counter_ = 1;
-  return (static_cast<EventId>(self_id_) << 16U) | static_cast<EventId>(event_counter_);
+  // At most kMaxEvents + 2 * kMaxAliases ids can be in use, so this always ends.
+  for (std::size_t attempt = 0; attempt <= kMaxEvents + 2 * kMaxAliases; ++attempt) {
+    ++event_counter_;
+    if (event_counter_ == 0) event_counter_ = 1;
+    const EventId id = (static_cast<EventId>(self_id_) << 16U) | static_cast<EventId>(event_counter_);
+    if (!idInUse(id)) return id;
+  }
+  return kNoEvent;  // unreachable while the capacities above hold
 }
 
 EventId SituationalAwarenessTable::resolve(EventId id) const noexcept {
@@ -344,7 +369,7 @@ void SituationalAwarenessTable::addAlias(EventId from, EventId to) noexcept {
     if (a.to == from) a.to = to;  // keep chains one hop long
   }
   if (aliases_.full()) aliases_.erase_at(0);
-  aliases_.push_back(Alias{from, to});
+  (void)aliases_.push_back(Alias{from, to});  // cannot fail: the oldest was dropped if full
 }
 
 void SituationalAwarenessTable::rename(EventId from, EventId to) noexcept {
@@ -357,40 +382,44 @@ void SituationalAwarenessTable::rename(EventId from, EventId to) noexcept {
   addAlias(from, to);
 }
 
-EventId SituationalAwarenessTable::associate(const SensorObservation& o) const noexcept {
-  if (o.event_hint != kNoEvent) {
-    const EventId h = resolve(o.event_hint);
-    if (findEvent(h) != nullptr) return h;
+// Can reading `o` come from the source behind `ev`? Different non-zero
+// signatures never match. A localised event must also pass a geometric gate:
+// many sources share a frequency (every 406 MHz distress beacon does).
+// An unlocalised event has no geometry yet, so a shared signature is all
+// there is to go on; such matches rank below any geometric match.
+bool SituationalAwarenessTable::gatePasses(const SensorObservation& o, const DetectedEvent& ev,
+                                           double& metric) const noexcept {
+  if (ev.signature != 0 && o.signature != 0 && ev.signature != o.signature) return false;
+  if (!ev.localized) {
+    metric = kUngatedMetric;
+    return ev.signature != 0 && ev.signature == o.signature;
   }
-  if (o.signature != 0) {
-    EventId best = kNoEvent;
-    for (const auto& ev : events_) {
-      if (ev.signature == o.signature && (best == kNoEvent || ev.id < best)) best = ev.id;
-    }
-    if (best != kNoEvent) return best;
+  if (o.has_fix) {
+    const double d = distanceM(o.fix, ev.position);
+    const double gate = cfg_.association_gate_m +
+                        cfg_.association_cep_factor * (static_cast<double>(ev.cep_m) + static_cast<double>(o.fix_cep_m));
+    metric = d;
+    return d <= gate;
   }
+  const double range = std::max(distanceM(o.observer_position, ev.position), 1.0);
+  const double diff = angleDiffDeg(static_cast<double>(o.bearing_deg), bearingDeg(o.observer_position, ev.position));
+  const double ang_unc = std::atan2(static_cast<double>(ev.cep_m), range) * kRad2Deg;
+  const double sigma = std::max(static_cast<double>(o.bearing_sigma_deg), cfg_.min_bearing_sigma_deg);
+  metric = diff;
+  return diff <= 3.0 * sigma + cfg_.bearing_gate_deg + ang_unc;
+}
 
+EventId SituationalAwarenessTable::associate(const SensorObservation& o) const noexcept {
+  double metric = 0.0;
+  if (o.event_hint != kNoEvent) {  // a hint is a preference, not a bypass of the gate
+    const DetectedEvent* h = findEvent(resolve(o.event_hint));
+    if (h != nullptr && gatePasses(o, *h, metric)) return h->id;
+  }
   EventId best = kNoEvent;
-  double best_metric = 1.0e18;
+  double best_metric = 0.0;
   for (const auto& ev : events_) {
-    if (!ev.localized) continue;
-    if (ev.signature != 0 && o.signature != 0 && ev.signature != o.signature) continue;
-    double metric;
-    if (o.has_fix) {
-      const double d = distanceM(o.fix, ev.position);
-      const double gate = cfg_.association_gate_m +
-                          cfg_.association_cep_factor * (static_cast<double>(ev.cep_m) + static_cast<double>(o.fix_cep_m));
-      if (d > gate) continue;
-      metric = d;
-    } else {
-      const double range = std::max(distanceM(o.observer_position, ev.position), 1.0);
-      const double diff = angleDiffDeg(static_cast<double>(o.bearing_deg), bearingDeg(o.observer_position, ev.position));
-      const double ang_unc = std::atan2(static_cast<double>(ev.cep_m), range) * kRad2Deg;
-      const double sigma = std::max(static_cast<double>(o.bearing_sigma_deg), cfg_.min_bearing_sigma_deg);
-      if (diff > 3.0 * sigma + cfg_.bearing_gate_deg + ang_unc) continue;
-      metric = diff;
-    }
-    if (metric < best_metric || (metric == best_metric && ev.id < best)) {
+    if (!gatePasses(o, ev, metric)) continue;
+    if (best == kNoEvent || metric < best_metric || (metric == best_metric && ev.id < best)) {
       best_metric = metric;
       best = ev.id;
     }
@@ -414,23 +443,24 @@ bool SituationalAwarenessTable::evictOne() noexcept {
 }
 
 EventId SituationalAwarenessTable::ingestObservation(const SensorObservation& o, TimeMs now) noexcept {
-  (void)now;
-  if (o.observer == kNoDrone || o.sensor == SensorType::NONE) return kNoEvent;
+  if (!isPlausible(o)) return kNoEvent;
+  if (o.timestamp_ms > now + cfg_.max_clock_skew_ms) return kNoEvent;              // from the future
+  if (elapsedMs(now, o.timestamp_ms) > cfg_.observation_max_age_ms) return kNoEvent;  // already expired
+
+  // The hint names an event we already hold under that id (possibly a
+  // different source that failed the gate); such an id can't be reused.
+  const bool hint_taken = o.event_hint != kNoEvent && idInUse(o.event_hint);
 
   DetectedEvent* ev = nullptr;
-  if (o.event_hint != kNoEvent) ev = findEvent(resolve(o.event_hint));
-
-  if (ev == nullptr) {
-    const EventId a = associate(o);
-    if (a != kNoEvent) {
-      ev = findEvent(a);
-      if (ev != nullptr && o.event_hint != kNoEvent && o.event_hint != ev->id) {
-        // Same source known under two ids: converge on the lower one.
-        if (o.event_hint < ev->id) {
-          rename(ev->id, o.event_hint);
-        } else {
-          addAlias(o.event_hint, ev->id);
-        }
+  const EventId a = associate(o);
+  if (a != kNoEvent) {
+    ev = findEvent(a);
+    if (ev != nullptr && o.event_hint != kNoEvent && o.event_hint != ev->id && !hint_taken) {
+      // Same source known under two ids: converge on the lower one.
+      if (o.event_hint < ev->id) {
+        rename(ev->id, o.event_hint);
+      } else {
+        addAlias(o.event_hint, ev->id);
       }
     }
   }
@@ -438,14 +468,16 @@ EventId SituationalAwarenessTable::ingestObservation(const SensorObservation& o,
   if (ev == nullptr) {
     if (events_.full() && !evictOne()) return kNoEvent;
     DetectedEvent n;
-    n.id = o.event_hint != kNoEvent ? o.event_hint : allocateEventId();
+    n.id = (o.event_hint != kNoEvent && !hint_taken) ? o.event_hint : allocateEventId();
+    if (n.id == kNoEvent) return kNoEvent;
     for (std::size_t i = aliases_.size(); i-- > 0;) {
       if (aliases_[i].from == n.id) aliases_.erase_at(i);
     }
     n.first_seen_ms = o.timestamp_ms;
-    events_.push_back(n);
+    if (!events_.push_back(n)) return kNoEvent;  // cannot fail: checked full/evicted above
     ev = &events_[events_.size() - 1];
   }
+  if (ev == nullptr) return kNoEvent;  // unreachable; keeps the non-null path explicit
 
   if (!insertObservation(*ev, o)) return ev->id;  // stale or duplicate reading
   ev->last_update_ms = std::max(ev->last_update_ms, o.timestamp_ms);
@@ -455,11 +487,22 @@ EventId SituationalAwarenessTable::ingestObservation(const SensorObservation& o,
 }
 
 bool SituationalAwarenessTable::shouldMerge(const DetectedEvent& a, const DetectedEvent& b) const noexcept {
-  if (a.signature != 0 && b.signature != 0) return a.signature == b.signature;
-  if (!a.localized || !b.localized) return false;
-  const double gate = cfg_.association_gate_m +
-                      cfg_.association_cep_factor * (static_cast<double>(a.cep_m) + static_cast<double>(b.cep_m));
-  return distanceM(a.position, b.position) <= gate;
+  if (a.signature != 0 && b.signature != 0 && a.signature != b.signature) return false;
+  if (a.localized && b.localized) {
+    const double gate = cfg_.association_gate_m +
+                        cfg_.association_cep_factor * (static_cast<double>(a.cep_m) + static_cast<double>(b.cep_m));
+    return distanceM(a.position, b.position) <= gate;
+  }
+  // At least one side has no position: only a shared signature can link them.
+  if (a.signature == 0 || a.signature != b.signature) return false;
+  const DetectedEvent* loc = a.localized ? &a : (b.localized ? &b : nullptr);
+  if (loc == nullptr) return true;  // two bearing-only events on one frequency: nothing separates them yet
+  const DetectedEvent& other = loc == &a ? b : a;
+  double metric = 0.0;
+  for (const auto& o : other.observations) {
+    if (!gatePasses(o, *loc, metric)) return false;  // its bearings must point at the fix
+  }
+  return true;
 }
 
 void SituationalAwarenessTable::mergeDuplicates() noexcept {
@@ -487,7 +530,7 @@ bool SituationalAwarenessTable::slotValid(const VerifierSlot& s, const DetectedE
   const DroneState* d = findDrone(s.id);
   if (d == nullptr) return false;
   if (d->mode != DroneMode::PACK_ROUTING && d->mode != DroneMode::VERIFYING) return false;
-  const TimeMs age = elapsed(now, s.since_ms);
+  const TimeMs age = elapsedMs(now, s.since_ms);
   if (d->mode == DroneMode::VERIFYING) {
     return resolve(d->tasked_event) == ev.id || age <= cfg_.slot_adopt_grace_ms;
   }
@@ -504,7 +547,7 @@ void SituationalAwarenessTable::refresh(TimeMs now) noexcept {
   for (std::size_t i = events_.size(); i-- > 0;) {
     DetectedEvent& ev = events_[i];
     for (std::size_t j = ev.observations.size(); j-- > 0;) {
-      if (elapsed(now, ev.observations[j].timestamp_ms) > cfg_.observation_max_age_ms) {
+      if (elapsedMs(now, ev.observations[j].timestamp_ms) > cfg_.observation_max_age_ms) {
         ev.observations.erase_at(j);
       }
     }
@@ -546,8 +589,11 @@ ClaimResult SituationalAwarenessTable::applyClaim(EventId event, DroneId claiman
     return ClaimResult::ACCEPTED;
   }
   const bool free_slot = slot.id == kNoDrone;
-  const bool better = score > slot.score + 1.0e-4f ||
-                      (std::fabs(score - slot.score) <= 1.0e-4f && claimant < slot.id);
+  // Compare scores quantised to 1e-4 so the order is total: every drone ends
+  // with the same holder whatever order the claims arrive in.
+  const std::int64_t q_new = quantiseScore(score);
+  const std::int64_t q_old = quantiseScore(slot.score);
+  const bool better = q_new > q_old || (q_new == q_old && claimant < slot.id);
   if (!free_slot && !better) return ClaimResult::REJECTED;
 
   VerifierSlot& other = ev->verifier[1 - role];
@@ -588,7 +634,7 @@ bool SituationalAwarenessTable::markBenign(std::uint32_t signature, bool learned
     if (oldest_learned == benign_.size()) return false;
     benign_.erase_at(oldest_learned);
   }
-  benign_.push_back(BenignSig{signature, learned});
+  if (!benign_.push_back(BenignSig{signature, learned})) return false;  // cannot fail: made room above
   if (learned) {
     for (auto& ev : events_) {
       if (ev.signature == signature) ev.verifier = {};

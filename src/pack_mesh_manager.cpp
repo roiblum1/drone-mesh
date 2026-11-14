@@ -4,12 +4,11 @@
 #include <array>
 
 #include "amc8270/mesh/geo.hpp"
+#include "amc8270/mesh/validation.hpp"
 
 namespace amc8270::mesh {
 
 namespace {
-
-TimeMs elapsed(TimeMs now, TimeMs then) noexcept { return now > then ? now - then : 0; }
 
 LinkType pickLink(LinkMask m) noexcept {
   if ((m & static_cast<LinkMask>(LinkType::LOS)) != 0) return LinkType::LOS;
@@ -23,6 +22,8 @@ PackMeshManager::PackMeshManager(DroneId self, const MeshConfig& cfg, IClock& cl
                                  IGmcsLink& gmcs, IGuidanceSink& guidance) noexcept
     : self_(self), cfg_(cfg), clock_(clock), radio_(radio), gmcs_(gmcs), guidance_(guidance), table_(self, cfg) {
   own_.id = self;
+  // Seed event ids from boot time so ids handed out before a restart are not reused.
+  table_.seedEventCounter(static_cast<std::uint16_t>((clock_.nowMs() / 1000U) & 0xFFFFU));
   table_.setSelf(exportedState());
 }
 
@@ -43,8 +44,13 @@ DroneState PackMeshManager::exportedState() const noexcept {
 }
 
 void PackMeshManager::updateOwnState(const DroneState& state) noexcept {
-  own_ = state;
-  own_.id = self_;
+  DroneState candidate = state;
+  candidate.id = self_;
+  if (!isPlausible(candidate)) {  // a NaN here would make every peer reject our heartbeats
+    ++stats_.local_rejected;
+    return;
+  }
+  own_ = candidate;
   if (own_.mode == DroneMode::VERIFYING) own_.mode = DroneMode::PACK_ROUTING;
   if (task_active_ && own_.mode != DroneMode::PACK_ROUTING) {
     cancelTask(true);  // GMCS took the drone (or it is recovering): drop the mesh task
@@ -57,6 +63,10 @@ bool PackMeshManager::reportLocalDetection(SensorObservation obs) noexcept {
   obs.observer = self_;
   obs.observer_position = own_.position;
   if (obs.timestamp_ms == 0) obs.timestamp_ms = now;
+  if (!isPlausible(obs)) {
+    ++stats_.local_rejected;
+    return false;
+  }
   if (obs.event_hint == kNoEvent) {
     obs.event_hint = table_.associate(obs);
     if (obs.event_hint == kNoEvent) obs.event_hint = table_.allocateEventId();
@@ -71,16 +81,16 @@ bool PackMeshManager::reportLocalDetection(SensorObservation obs) noexcept {
 void PackMeshManager::applyGmcsDismissal(std::uint32_t signature) noexcept {
   if (signature == 0) return;
   if (table_.markBenign(signature, true)) ++stats_.signatures_learned;
-  broadcast(SignatureUpdatePayload{signature}, clock_.nowMs());
+  (void)broadcast(SignatureUpdatePayload{signature}, clock_.nowMs());
 }
 
 void PackMeshManager::addKnownBenignSignature(std::uint32_t signature) noexcept {
-  table_.markBenign(signature, false);
+  (void)table_.markBenign(signature, false);  // false just means it was already known
 }
 
 void PackMeshManager::shutdown() noexcept {
   cancelTask(true);
-  broadcast(LeavePayload{}, clock_.nowMs());
+  (void)broadcast(LeavePayload{}, clock_.nowMs());
 }
 
 // ---------------------------------------------------------------- radio
@@ -123,11 +133,26 @@ void PackMeshManager::handlePacket(const MeshPacket& pkt, TimeMs now) noexcept {
   }
   table_.notePacket(pkt.header.src, pkt.header.seq, now);
 
+  // A drone only speaks for itself: it relays nothing, so the named observer,
+  // claimant or issuer must be the sender. (Without message authentication
+  // this stops accidents and naive spoofing, not a determined attacker.)
   if (const auto* ob = std::get_if<ObservationPayload>(&pkt.payload)) {
-    table_.ingestObservation(ob->obs, now);
+    if (ob->obs.observer != pkt.header.src) {
+      ++stats_.rx_rejected;
+      return;
+    }
+    (void)table_.ingestObservation(ob->obs, now);
   } else if (const auto* c = std::get_if<TaskClaimPayload>(&pkt.payload)) {
-    table_.applyClaim(c->event_id, c->claimant, c->role, c->score, now);
+    if (c->claimant != pkt.header.src) {
+      ++stats_.rx_rejected;
+      return;
+    }
+    (void)table_.applyClaim(c->event_id, c->claimant, c->role, c->score, now);
   } else if (const auto* a = std::get_if<AlertIssuedPayload>(&pkt.payload)) {
+    if (a->issuer != pkt.header.src) {
+      ++stats_.rx_rejected;
+      return;
+    }
     table_.markAlertSent(a->event_id, a->level);
   } else if (const auto* s = std::get_if<SignatureUpdatePayload>(&pkt.payload)) {
     if (table_.markBenign(s->signature, true)) ++stats_.signatures_learned;
@@ -140,27 +165,43 @@ void PackMeshManager::sendHeartbeat(TimeMs now) noexcept {
   last_heartbeat_ms_ = now;
   heartbeat_requested_ = false;
   table_.setSelf(exportedState());
-  broadcast(HeartbeatPayload{exportedState()}, now);
+  (void)broadcast(HeartbeatPayload{exportedState()}, now);
 }
 
 // Re-send our own readings and learned signatures so a lost packet only
 // delays convergence instead of leaving drones with different pictures.
 void PackMeshManager::sendAntiEntropy(TimeMs now) noexcept {
   last_anti_entropy_ms_ = now;
-  std::uint32_t sent = 0;
+
+  // Own readings, at most max_antientropy_per_cycle per cycle. The start point
+  // rotates so every reading is re-sent eventually, however many there are.
+  std::uint32_t total = 0;
   for (const auto& ev : table_.events()) {
-    for (const auto& o : ev.observations) {
-      if (o.observer != self_ || sent >= cfg_.max_antientropy_per_cycle) continue;
-      SensorObservation copy = o;
-      copy.event_hint = ev.id;
-      if (broadcast(ObservationPayload{copy}, now)) {
-        ++sent;
-        ++stats_.observations_sent;
+    for (const auto& o : ev.observations) total += o.observer == self_ ? 1U : 0U;
+  }
+  if (total > 0) {
+    const std::uint32_t start = ae_cursor_ % total;
+    std::uint32_t sent = 0;
+    for (std::uint32_t pass = 0; pass < 2; ++pass) {  // [start, total) then [0, start)
+      std::uint32_t idx = 0;
+      for (const auto& ev : table_.events()) {
+        for (const auto& o : ev.observations) {
+          if (o.observer != self_) continue;
+          const bool in_pass = pass == 0 ? idx >= start : idx < start;
+          ++idx;
+          if (!in_pass || sent >= cfg_.max_antientropy_per_cycle) continue;
+          SensorObservation copy = o;
+          copy.event_hint = ev.id;
+          if (broadcast(ObservationPayload{copy}, now)) ++stats_.observations_sent;
+          ++sent;  // count attempts so a failing radio can't stall the rotation
+        }
       }
     }
+    ae_cursor_ = (start + sent) % total;
   }
+
   for (std::size_t i = 0; i < table_.learnedCount(); ++i) {
-    broadcast(SignatureUpdatePayload{table_.learnedAt(i)}, now);
+    (void)broadcast(SignatureUpdatePayload{table_.learnedAt(i)}, now);
   }
 }
 
@@ -171,9 +212,9 @@ void PackMeshManager::tick() noexcept {
   receiveAll(now);
   stats_.peers_lost += static_cast<std::uint32_t>(table_.expirePeers(now));
 
-  if (heartbeat_requested_ || elapsed(now, last_heartbeat_ms_) >= cfg_.heartbeat_period_ms) sendHeartbeat(now);
-  if (elapsed(now, last_anti_entropy_ms_) >= cfg_.anti_entropy_period_ms) sendAntiEntropy(now);
-  if (elapsed(now, last_eval_ms_) >= cfg_.coordination_period_ms) evaluateAndCoordinateAlerts(now);
+  if (heartbeat_requested_ || isDue(now, last_heartbeat_ms_, cfg_.heartbeat_period_ms)) sendHeartbeat(now);
+  if (isDue(now, last_anti_entropy_ms_, cfg_.anti_entropy_period_ms)) sendAntiEntropy(now);
+  if (isDue(now, last_eval_ms_, cfg_.coordination_period_ms)) evaluateAndCoordinateAlerts(now);
 }
 
 // ---------------------------------------------- distributed coordination
@@ -250,7 +291,7 @@ void PackMeshManager::syncOwnTask(const Assignment* mine, TimeMs now) noexcept {
     ++stats_.tasks_issued;
     heartbeat_requested_ = true;
     table_.setSelf(exportedState());
-  } else if (elapsed(now, last_claim_ms_) < 2ULL * static_cast<TimeMs>(cfg_.anti_entropy_period_ms)) {
+  } else if (!isDue(now, last_claim_ms_, 2ULL * static_cast<TimeMs>(cfg_.anti_entropy_period_ms))) {
     return;
   }
 
@@ -281,7 +322,7 @@ void PackMeshManager::dispatchAlerts(TimeMs now) noexcept {
 
     const int rank = alertOwnerRank(table_, ev, self_);
     if (rank < 0) continue;
-    if (elapsed(now, ready) < static_cast<TimeMs>(rank) * cfg_.alert_backup_delay_ms) continue;
+    if (elapsedMs(now, ready) < static_cast<TimeMs>(rank) * cfg_.alert_backup_delay_ms) continue;
 
     GmcsAlert alert;
     alert.event_id = ev.id;
@@ -301,7 +342,7 @@ void PackMeshManager::dispatchAlerts(TimeMs now) noexcept {
       continue;
     }
     table_.markAlertSent(ev.id, level);
-    broadcast(AlertIssuedPayload{ev.id, level, self_}, now);
+    (void)broadcast(AlertIssuedPayload{ev.id, level, self_}, now);  // peers' backup delay covers a lost copy
     if (level == AlertLevel::PRIORITY) {
       ++stats_.priority_alerts_sent;
     } else {
