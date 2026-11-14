@@ -8,6 +8,7 @@
 // different seeds (and the scenario's position and timing jitter) and prints
 // the distributions of time to alert, position error and false alerts.
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -66,6 +67,8 @@ void printRun(const sim::Scenario& sc, const TrialResult& r) {
               r.mean_kbps_per_drone, r.peak_kbps_per_drone);
   std::printf("alerts at the GMCS: %zu (false: %d advisory, %d priority; duplicates %d)\n", r.alerts.size(),
               r.false_advisories, r.false_priorities, r.duplicate_alerts);
+  std::printf("GMCS records after de-duplication: %d (false %d, duplicate %d, missed acknowledgement deadlines %d)\n",
+              r.gmcs.records, r.gmcs.false_records, r.gmcs.duplicate_records, r.gmcs.escalations);
   for (std::size_t k = 0; k < sc.emitters.size(); ++k) {
     const auto& e = sc.emitters[k];
     if (!e.alertable) continue;
@@ -130,7 +133,8 @@ int monteCarlo(const sim::Scenario& sc, int trials, unsigned threads, const std:
   std::printf("  %-34s %6s  %10s  %10s  %10s  %10s\n", "", "rate", "", "", "", "");
 
   std::vector<Dist> t_adv(sc.emitters.size()), t_pri(sc.emitters.size()), err_pri(sc.emitters.size());
-  Dist false_adv, false_pri, dup, load_mean, load_peak, fcs;
+  Dist false_adv, false_pri, dup, load_mean, load_peak, fcs, recs, false_recs, dup_recs;
+  std::array<Dist, 3> transport, detection;
   double hours = 0;
   int false_adv_total = 0, false_pri_total = 0, false_clutter = 0, false_multipath = 0;
   std::vector<int> check_pass(sc.expects.size(), 0);
@@ -151,6 +155,13 @@ int monteCarlo(const sim::Scenario& sc, int trials, unsigned threads, const std:
     false_multipath += r.false_from_multipath;
     dup.add(r.duplicate_alerts);
     fcs.add(r.max_fcs_requests);
+    recs.add(r.gmcs.records);
+    false_recs.add(r.gmcs.false_records);
+    dup_recs.add(r.gmcs.duplicate_records);
+    for (std::size_t l = 0; l < 3; ++l) {
+      for (const double x : r.gmcs.transport_ms[l]) transport[l].add(x);
+      for (const double x : r.gmcs.detection_s[l]) detection[l].add(x);
+    }
     load_mean.add(r.mean_kbps_per_drone);
     load_peak.add(r.peak_kbps_per_drone);
     hours += r.hours_flown;
@@ -176,6 +187,22 @@ int monteCarlo(const sim::Scenario& sc, int trials, unsigned threads, const std:
   std::printf("    causes: %d from clutter, %d a real source mislocalised by multipath\n", false_clutter, false_multipath);
   std::printf("  duplicate alerts (same source, same level) per trial: mean %.2f, p95 %.0f, max %.0f\n", dup.mean(),
               dup.pct(95), dup.max());
+  std::printf("\n  at the GMCS, after the alert consumer's de-duplication:\n");
+  std::printf("    records per trial: mean %.2f; false records %.2f per drone-hour; records beyond the first for one source: mean %.2f, max %.0f\n",
+              recs.mean(), false_recs.mean() * static_cast<double>(n) / std::max(hours, 1e-9), dup_recs.mean(), dup_recs.max());
+  static const char* kLinks[3] = {"LOS", "LEO", "GEO"};
+  for (std::size_t l = 0; l < 3; ++l) {
+    if (transport[l].v.empty()) continue;
+    std::printf("    transport latency %s: p50 %.0f ms, p95 %.0f ms (%zu alerts)\n", kLinks[l], transport[l].pct(50),
+                transport[l].pct(95), transport[l].v.size());
+  }
+  if (!detection[1].v.empty()) {
+    std::printf("    first detection -> ADVISORY at the GMCS: p50 %.1f s, p95 %.1f s\n", detection[1].pct(50), detection[1].pct(95));
+  }
+  if (!detection[2].v.empty()) {
+    std::printf("    first detection -> PRIORITY at the GMCS: p50 %.1f s, p95 %.1f s\n", detection[2].pct(50), detection[2].pct(95));
+  }
+  std::printf("\n");
   std::printf("  FCS requests by the busiest drone per trial: p50 %.0f, p95 %.0f, max %.0f\n", fcs.pct(50), fcs.pct(95),
               fcs.max());
   std::printf("  mesh load per drone: mean %.2f kbit/s (p95 over trials %.2f); peak 1 s window p95 %.2f kbit/s\n",
@@ -211,6 +238,14 @@ int monteCarlo(const sim::Scenario& sc, int trials, unsigned threads, const std:
     std::fprintf(f, "},");
     jsonDist(f, "duplicates_per_trial", dup);
     jsonDist(f, "max_fcs_requests_per_trial", fcs);
+    jsonDist(f, "gmcs_records_per_trial", recs);
+    jsonDist(f, "gmcs_false_records_per_trial", false_recs);
+    jsonDist(f, "gmcs_duplicate_records_per_trial", dup_recs);
+    jsonDist(f, "transport_ms_los", transport[0]);
+    jsonDist(f, "transport_ms_leo", transport[1]);
+    jsonDist(f, "transport_ms_geo", transport[2]);
+    jsonDist(f, "detection_to_advisory_s", detection[1]);
+    jsonDist(f, "detection_to_priority_s", detection[2]);
     jsonDist(f, "mean_kbps_per_drone", load_mean);
     jsonDist(f, "peak_kbps_per_drone", load_peak);
     std::fprintf(f, "\"checks\":[");

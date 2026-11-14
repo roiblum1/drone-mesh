@@ -10,6 +10,7 @@
 #include <memory>
 #include <new>
 
+#include "amc8270/gmcs/alert_consumer.hpp"
 #include "amc8270/mesh/crypto.hpp"
 #include "amc8270/mesh/geo.hpp"
 #include "amc8270/mesh/mesh_security.hpp"
@@ -17,6 +18,7 @@
 #include "amc8270/mesh/validation.hpp"
 
 using namespace amc8270::mesh;
+namespace gmcs = amc8270::gmcs;
 
 // ---------------------------------------------------------------- heap probe
 static std::size_t g_allocs = 0;
@@ -2205,6 +2207,165 @@ TEST(incumbency_is_per_slot) {
   planAssignments(*t, drones, now, cfg, plan);
   CHECK(plan.size() == 2);
   for (const auto& a : plan) CHECK((a.drone == 2 && a.role == 0) || (a.drone == 3 && a.role == 1));
+}
+
+// ------------------------------------------------- GMCS-side alert consumer
+
+struct FakeUplink : gmcs::IUplink {
+  std::array<std::uint32_t, 16> sent{};
+  std::size_t n = 0;
+  bool fail = false;
+  bool sendDismissal(std::uint32_t signature) override {
+    if (fail || n >= sent.size()) return false;
+    sent[n++] = signature;
+    return true;
+  }
+};
+
+static GmcsAlert makeAlert(EventId id, AlertLevel level, const GeoPoint& at, float cep, std::uint32_t sig, TimeMs issued,
+                           TimeMs first_seen = 0) {
+  GmcsAlert a;
+  a.event_id = id;
+  a.level = level;
+  a.cls = EventClass::DISTRESS_BEACON;
+  a.position = at;
+  a.cep_m = cep;
+  a.confidence = level == AlertLevel::PRIORITY ? 0.99f : 0.85f;
+  a.signature = sig;
+  a.issuer = 3;
+  a.first_seen_ms = first_seen;
+  a.timestamp_ms = issued;
+  return a;
+}
+
+TEST(gmcs_folds_duplicates_by_id_and_by_place) {
+  FakeUplink up;
+  gmcs::AlertConsumer c(gmcs::ConsumerConfig{}, up);
+  const TimeMs t0 = 1'700'000'000'000ULL;
+  const GeoPoint p = enu(16000, 8000);
+  CHECK(c.onAlert(makeAlert(0x027101, AlertLevel::ADVISORY, p, 700.0f, 406025, t0, t0 - 9000), LinkType::LOS, t0 + 70) ==
+        gmcs::IngestResult::NEW_RECORD);
+  // The same id again (a backup that missed the notice): a duplicate.
+  CHECK(c.onAlert(makeAlert(0x027101, AlertLevel::ADVISORY, p, 700.0f, 406025, t0 + 3000), LinkType::LEO, t0 + 3200) ==
+        gmcs::IngestResult::DUPLICATE);
+  // The other side of a mesh partition, under its own id, 600 m away: same source.
+  CHECK(c.onAlert(makeAlert(0x057101, AlertLevel::ADVISORY, enu(16500, 8300), 800.0f, 406025, t0 + 5000), LinkType::LOS,
+                  t0 + 5060) == gmcs::IngestResult::DUPLICATE);
+  CHECK(c.records().size() == 1);
+  CHECK(c.stats().merged_by_place == 1);
+  const gmcs::Record* r = c.findByEvent(0x057101);
+  CHECK(r != nullptr && r == c.findByEvent(0x027101) && r->event_ids.size() == 2 && r->reports == 3);
+  // A second beacon on the same frequency 40 km away is another record; a
+  // different frequency next door is too.
+  CHECK(c.onAlert(makeAlert(0x037101, AlertLevel::ADVISORY, enu(56000, 8000), 700.0f, 406025, t0 + 6000), LinkType::LOS,
+                  t0 + 6050) == gmcs::IngestResult::NEW_RECORD);
+  CHECK(c.onAlert(makeAlert(0x047101, AlertLevel::ADVISORY, enu(16200, 8100), 700.0f, 121500, t0 + 6000), LinkType::LOS,
+                  t0 + 6050) == gmcs::IngestResult::NEW_RECORD);
+  CHECK(c.records().size() == 3);
+  // The PRIORITY upgrades the first record and needs the operator again; a
+  // better estimate at the same level only updates it.
+  CHECK(c.acknowledge(r->record_id, t0 + 9000));
+  CHECK(c.find(r->record_id)->state == gmcs::RecordState::ACKNOWLEDGED);
+  CHECK(c.onAlert(makeAlert(0x027101, AlertLevel::PRIORITY, enu(16030, 7980), 70.0f, 406025, t0 + 300000), LinkType::LOS,
+                  t0 + 300080) == gmcs::IngestResult::UPGRADED);
+  r = c.findByEvent(0x027101);
+  CHECK(r != nullptr && r->state == gmcs::RecordState::NEW && r->level == AlertLevel::PRIORITY && r->cep_m == 70.0f);
+  CHECK(c.onAlert(makeAlert(0x027101, AlertLevel::PRIORITY, enu(16020, 7990), 40.0f, 406025, t0 + 310000), LinkType::LOS,
+                  t0 + 310060) == gmcs::IngestResult::UPDATED);
+  CHECK(c.stats().alerts == 7 && c.stats().records == 3 && c.stats().upgrades == 1 && c.stats().updates == 1);
+}
+
+TEST(gmcs_acknowledgement_deadlines_escalate) {
+  FakeUplink up;
+  gmcs::ConsumerConfig cfg;
+  gmcs::AlertConsumer c(cfg, up);
+  const TimeMs t0 = 1'700'000'000'000ULL;
+  CHECK(c.onAlert(makeAlert(1, AlertLevel::PRIORITY, enu(0, 0), 70.0f, 0, t0), LinkType::LOS, t0) == gmcs::IngestResult::NEW_RECORD);
+  CHECK(c.onAlert(makeAlert(2, AlertLevel::ADVISORY, enu(30000, 0), 700.0f, 0, t0), LinkType::LOS, t0) == gmcs::IngestResult::NEW_RECORD);
+  c.tick(t0 + cfg.ack_deadline_priority_ms + 1);
+  CHECK(c.stats().escalations == 1);  // the PRIORITY, not yet the ADVISORY
+  CHECK(c.findByEvent(1)->escalated && !c.findByEvent(2)->escalated);
+  CHECK(c.acknowledge(c.findByEvent(2)->record_id, t0 + 60000));
+  c.tick(t0 + cfg.ack_deadline_advisory_ms + 1);
+  CHECK(c.stats().escalations == 1);  // acknowledged in time
+  CHECK(c.openCount() == 1);
+  CHECK(c.stats().operator_ack.count() == 1 && std::fabs(c.stats().operator_ack.mean() - 60000.0) < 1.0);
+}
+
+TEST(gmcs_dismissal_teaches_the_pack_and_suppresses) {
+  FakeUplink up;
+  gmcs::ConsumerConfig cfg;
+  gmcs::AlertConsumer c(cfg, up);
+  const TimeMs t0 = 1'700'000'000'000ULL;
+  CHECK(c.onAlert(makeAlert(1, AlertLevel::ADVISORY, enu(0, 0), 700.0f, 433920, t0), LinkType::LOS, t0) == gmcs::IngestResult::NEW_RECORD);
+  const std::uint32_t rec = c.findByEvent(1)->record_id;
+  // The C2 link is down at first: the uplink is retried until it is accepted.
+  up.fail = true;
+  CHECK(c.dismiss(rec, t0 + 1000));
+  CHECK(c.uplinkPending() && c.stats().uplink_failures == 1);
+  c.tick(t0 + 2000);
+  CHECK(c.stats().uplink_failures == 1);  // not before the retry interval
+  up.fail = false;
+  c.tick(t0 + 1000 + cfg.uplink_retry_ms);
+  CHECK(!c.uplinkPending() && up.n == 1 && up.sent[0] == 433920u);
+  // Later alerts on that frequency, anywhere, are suppressed.
+  CHECK(c.onAlert(makeAlert(9, AlertLevel::ADVISORY, enu(5000, 0), 700.0f, 433920, t0 + 60000), LinkType::LOS, t0 + 60000) ==
+        gmcs::IngestResult::SUPPRESSED);
+  // A thermal source with no frequency can only be suppressed here, by place.
+  CHECK(c.onAlert(makeAlert(2, AlertLevel::ADVISORY, enu(40000, 0), 70.0f, 0, t0), LinkType::LOS, t0) == gmcs::IngestResult::NEW_RECORD);
+  CHECK(c.dismiss(c.findByEvent(2)->record_id, t0 + 1000));
+  CHECK(up.n == 1);  // nothing to teach the pack
+  CHECK(c.onAlert(makeAlert(3, AlertLevel::ADVISORY, enu(40300, 0), 70.0f, 0, t0 + 9000), LinkType::LOS, t0 + 9000) ==
+        gmcs::IngestResult::SUPPRESSED);
+  CHECK(c.onAlert(makeAlert(4, AlertLevel::ADVISORY, enu(48000, 0), 70.0f, 0, t0 + 9000), LinkType::LOS, t0 + 9000) ==
+        gmcs::IngestResult::NEW_RECORD);
+  // A frequency the pack never alerted on (known from elsewhere) can be dismissed too.
+  CHECK(c.dismissSignature(162550, t0 + 10000) && up.n == 2 && up.sent[1] == 162550u);
+  CHECK(c.stats().suppressed == 2);
+}
+
+TEST(gmcs_latency_accounting) {
+  FakeUplink up;
+  gmcs::AlertConsumer c(gmcs::ConsumerConfig{}, up);
+  const TimeMs t0 = 1'700'000'000'000ULL;
+  for (int k = 0; k < 10; ++k) {
+    const TimeMs issued = t0 + static_cast<TimeMs>(k) * 100000;
+    (void)c.onAlert(makeAlert(static_cast<EventId>(100 + k), AlertLevel::ADVISORY, enu(10000.0 * k, 0), 500.0f, 0, issued,
+                              issued - 12000),
+                    k % 2 == 0 ? LinkType::LOS : LinkType::GEO, issued + (k % 2 == 0 ? 60 : 650));
+  }
+  const auto& los = c.stats().transport[0];
+  const auto& geo = c.stats().transport[2];
+  CHECK(los.count() == 5 && geo.count() == 5);
+  CHECK(std::fabs(los.mean() - 60.0) < 1e-9 && std::fabs(geo.mean() - 650.0) < 1e-9);
+  CHECK(los.percentile(50) >= 50.0 && los.percentile(50) <= 60.0);
+  CHECK(geo.min() == 650.0 && geo.max() == 650.0 && geo.percentile(95) == 650.0);
+  const auto& det = c.stats().detection_to_gmcs[1];
+  CHECK(det.count() == 10 && det.min() == 12060.0 && det.max() == 12650.0);
+  // A histogram's percentiles stay inside the observed range and are monotonic.
+  gmcs::LatencyStats s;
+  for (int k = 1; k <= 1000; ++k) s.add(k);
+  CHECK(s.percentile(5) <= s.percentile(50) && s.percentile(50) <= s.percentile(95));
+  CHECK(s.percentile(50) > 300.0 && s.percentile(50) < 700.0 && s.percentile(100) == 1000.0);
+}
+
+TEST(gmcs_keeps_room_for_open_records) {
+  FakeUplink up;
+  gmcs::AlertConsumer c(gmcs::ConsumerConfig{}, up);
+  const TimeMs t0 = 1'700'000'000'000ULL;
+  for (std::size_t k = 0; k < gmcs::kMaxRecords; ++k) {
+    (void)c.onAlert(makeAlert(static_cast<EventId>(k + 1), AlertLevel::PRIORITY, enu(5000.0 * static_cast<double>(k), 90000),
+                              70.0f, 0, t0),
+                    LinkType::LOS, t0);
+  }
+  CHECK(c.records().size() == gmcs::kMaxRecords);
+  // Every record is an open PRIORITY: a new one cannot push one out.
+  CHECK(c.onAlert(makeAlert(999, AlertLevel::PRIORITY, enu(0, -90000), 70.0f, 0, t0), LinkType::LOS, t0) ==
+        gmcs::IngestResult::REJECTED);
+  CHECK(c.close(c.findByEvent(5)->record_id));
+  CHECK(c.onAlert(makeAlert(999, AlertLevel::PRIORITY, enu(0, -90000), 70.0f, 0, t0), LinkType::LOS, t0) ==
+        gmcs::IngestResult::NEW_RECORD);
+  CHECK(c.findByEvent(5) == nullptr && c.findByEvent(999) != nullptr);
 }
 
 // ----------------------------------------------------------------------- main

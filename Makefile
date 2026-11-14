@@ -18,7 +18,7 @@ INC      := -Iinclude
 OPT      ?= -O2 -g
 
 LIB_SRCS := $(wildcard src/*.cpp)
-HDRS     := $(wildcard include/amc8270/mesh/*.hpp)
+HDRS     := $(wildcard include/amc8270/mesh/*.hpp include/amc8270/gmcs/*.hpp)
 SIM_SRCS := sim/pack_sim.cpp sim/scenario.cpp sim/world.cpp
 SIM_HDRS := sim/sim.hpp
 SCENARIOS := $(wildcard sim/scenarios/*.scn)

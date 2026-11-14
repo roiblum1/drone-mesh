@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "amc8270/gmcs/alert_consumer.hpp"
 #include "amc8270/mesh/pack_mesh_manager.hpp"
 
 namespace sim {
@@ -160,6 +161,18 @@ struct AlertRecord {
   int majority_source = -1;  // the emitter most of its readings came from, -1 if clutter
   int reflected = 0;         // how many of its readings were multipath reflections
   int readings = 0;
+  amc8270::gmcs::IngestResult ingest = amc8270::gmcs::IngestResult::NEW_RECORD;  // what the GMCS made of it
+  std::uint32_t record_id = 0;
+};
+
+// What the operator ends up with, after the GMCS consumer has de-duplicated.
+struct GmcsOutcome {
+  int records = 0;
+  int false_records = 0;         // records with no real, alertable source near them
+  int duplicate_records = 0;     // records beyond the first for one real source
+  int escalations = 0;           // records that missed their acknowledgement deadline
+  std::vector<double> transport_ms[3];  // drone issue -> GMCS receipt, by link
+  std::vector<double> detection_s[3];   // pack's first detection -> GMCS receipt, by level
 };
 
 struct TaskRecord {
@@ -197,6 +210,7 @@ struct TrialResult {
   std::vector<TaskRecord> tasks;
   std::vector<EmitterOutcome> emitters;
   std::vector<CheckResult> checks;
+  GmcsOutcome gmcs;
   int false_advisories = 0;
   int false_priorities = 0;
   int false_from_clutter = 0;    // false alerts whose readings were mostly clutter

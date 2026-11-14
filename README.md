@@ -111,6 +111,7 @@ Running the flight code under these conditions exposed defects that the synchron
 | `coordination.hpp/.cpp` | Mission task prioritisation: urgency, suitability, verifier selection, alert levels and alert-owner ranking (pure functions) |
 | `pack_mesh_manager.hpp/.cpp` | `PackMeshManager`: discovery, state sync, `evaluateAndCoordinateAlerts()` |
 | `hal.hpp` | Interfaces to the Mesh Network Transceiver, clock, C2 link and FCS, so the logic runs on any RTOS, a host, or the simulator |
+| `gmcs/alert_consumer.hpp`, `src/gmcs_alert_consumer.cpp` | GMCS side: the alert consumer (de-duplication, acknowledgement, dismissal workflow, latency accounting) |
 
 ### Pack independence: how a pack decides with no leader
 
@@ -119,6 +120,17 @@ Running the flight code under these conditions exposed defects that the synchron
 3. `evaluateAndCoordinateAlerts()` runs every 0.5 s on every drone: fuse bearings into positions, merge duplicate events, rank by urgency (mission task prioritisation), and compute the verifier plan. The plan is a deterministic function of the table, so drones with the same table agree without negotiating.
 4. A drone that finds itself in the plan sends a request to the FCS (standoff point, approach bearing, sensor to cue) and claims its slot on the mesh. Claims are arbitrated by score (quantised, so every drone ends with the same holder whatever the arrival order), ties by lowest id. A drone that loses arbitration is not ordered off its task; it gives way at the next plan, because the winner now holds the incumbent bonus.
 5. Alerts to the GMCS: ADVISORY once an event is localised well enough, PRIORITY once two sensor types agree. One drone is the owner, with ranked backups; the GMCS also de-duplicates by event id.
+
+### At the GMCS: the alert consumer
+
+`amc8270::gmcs::AlertConsumer` turns the pack's alerts into records an operator works through.
+
+- **De-duplication.** An alert folds into an existing record by event id, or else by place: a compatible frequency, within max(2 km, 3 x the combined CEP), seen within 30 minutes. That catches the same source reported under two ids, as a mesh partition or a split under multipath can do. A PRIORITY on an ADVISORY record upgrades it and re-opens it for acknowledgement. A better estimate updates the position. Anything else is counted as a duplicate.
+- **Acknowledgement.** Records start NEW. An unacknowledged PRIORITY past 30 s, or an ADVISORY past 2 minutes, is flagged as escalated.
+- **Dismissal.** The operator declares a record benign. If it carries a frequency, the consumer sends it to the pack through `IUplink`, retrying until the C2 link accepts it, and every drone then learns it. If the pack keeps alerting on a dismissed frequency, the uplink is sent again. A record with no frequency (a fire, say) can only be suppressed at the GMCS, by place. A frequency the pack never alerted on can be dismissed directly.
+- **Latency.** Transport time (drone issue to GMCS receipt) per link, first detection to receipt per alert level, and operator receipt to acknowledgement, in fixed-bin histograms.
+
+The simulator runs every alert through it. In the 16-drone Monte Carlo, raw duplicate alerts (0.47 per trial) become 0.03 duplicate records.
 
 ### Rules the flight library follows
 

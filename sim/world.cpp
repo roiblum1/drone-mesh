@@ -180,6 +180,13 @@ struct Guidance : mesh::IGuidanceSink {
   void cancelVerification() override;
 };
 
+// The GMCS's uplink for a dismissal: over the fastest C2 link to the drone the
+// operator flies, or else any drone with a link.
+struct SimUplink : amc8270::gmcs::IUplink {
+  World* w = nullptr;
+  bool sendDismissal(std::uint32_t signature) override;
+};
+
 struct Reflection {
   double until_s = -1;
   double bias_deg = 0;
@@ -289,6 +296,11 @@ class World {
   std::vector<TaskRecord> tasks_;
   std::vector<std::uint64_t> bytes_per_s_;
   std::vector<std::uint64_t> bytes_by_src_;
+  SimUplink uplink_;
+  amc8270::gmcs::AlertConsumer consumer_;
+ public:
+  bool uplink(std::uint32_t signature);
+ private:
   std::uint64_t datagrams_ = 0, lost_ = 0, bytes_ = 0;
   std::vector<std::size_t> next_script_;
   std::vector<bool> script_done_;
@@ -320,6 +332,8 @@ class World {
   }
 };
 
+bool SimUplink::sendDismissal(std::uint32_t signature) { return w->uplink(signature); }
+
 bool Node::send(const std::uint8_t* d, std::size_t n) {
   w->broadcast(idx, d, n);
   return true;
@@ -335,7 +349,9 @@ World::World(const Scenario& sc, const RunOptions& opt)
       terrain_(sc.hills, sc.ridges),
       rng_(opt.seed * 2654435761ULL + 17U),
       sensor_rng_(opt.seed * 40503ULL + 0xC0FFEEULL),
-      emitters_(sc.emitters) {
+      emitters_(sc.emitters),
+      consumer_(amc8270::gmcs::ConsumerConfig{}, uplink_) {
+  uplink_.w = this;
   Rng setup(opt.seed + 99991U);
   if (opt.mc_jitter) {
     for (auto& e : emitters_) {
@@ -713,21 +729,18 @@ void World::runScript() {
         say("FAULT  D%d lost", s.drone);
         break;
       case ScriptKind::DISMISS: {
-        // The operator marks the source benign; the GMCS uplinks it to the
-        // drone it is flying (or any drone with a C2 link) over the fastest link.
-        int to = -1;
-        for (std::size_t k = 0; k < drones_.size() && to < 0; ++k) {
-          if (drones_[k]->alive && drones_[k]->commanded == DroneMode::ACTIVE_MISSION) to = static_cast<int>(k);
+        // The operator marks the source benign at the GMCS: the record if there is
+        // one (an alert was raised), else the frequency directly. The consumer
+        // uplinks the signature to the pack and suppresses later alerts on it.
+        if (em < 0) break;
+        const std::uint32_t sig = emitters_[static_cast<std::size_t>(em)].sig;
+        std::uint32_t record = 0;
+        for (const auto& r : consumer_.records()) {
+          if (sig != 0 && r.signature == sig) record = r.record_id;
         }
-        for (std::size_t k = 0; k < drones_.size() && to < 0; ++k) {
-          if (drones_[k]->alive && drones_[k]->spec.links != 0) to = static_cast<int>(k);
-        }
-        if (to < 0 || em < 0) break;
-        const LinkType link = firstLink(drones_[static_cast<std::size_t>(to)]->spec.links);
-        const double delay = sc_.c2.latency_ms[static_cast<std::size_t>(linkIndex(link))] + rng_.exponential(sc_.c2.jitter_ms);
-        c2_up_.push_back(PendingUplink{now_ms_ + static_cast<TimeMs>(std::llround(delay)), to, emitters_[static_cast<std::size_t>(em)].sig});
-        say("GMCS   operator dismisses the %s as benign (uplink to D%d via %s)", s.label.c_str(),
-            drones_[static_cast<std::size_t>(to)]->spec.id, linkName(link));
+        const bool ok = record != 0 ? consumer_.dismiss(record, now_ms_) : consumer_.dismissSignature(sig, now_ms_);
+        say("GMCS   operator dismisses the %s as benign (%s)", s.label.c_str(),
+            !ok ? "nothing to dismiss" : record != 0 ? "its alert record" : "by frequency, no alert was raised");
         break;
       }
       case ScriptKind::PARTITION:
@@ -743,6 +756,24 @@ void World::runScript() {
     }
     script_done_[i] = true;
   }
+}
+
+bool World::uplink(std::uint32_t signature) {
+  int to = -1;
+  for (std::size_t k = 0; k < drones_.size() && to < 0; ++k) {
+    if (drones_[k]->alive && drones_[k]->commanded == DroneMode::ACTIVE_MISSION && drones_[k]->spec.links != 0) {
+      to = static_cast<int>(k);
+    }
+  }
+  for (std::size_t k = 0; k < drones_.size() && to < 0; ++k) {
+    if (drones_[k]->alive && drones_[k]->spec.links != 0) to = static_cast<int>(k);
+  }
+  if (to < 0) return false;
+  const LinkType link = firstLink(drones_[static_cast<std::size_t>(to)]->spec.links);
+  const double delay = sc_.c2.latency_ms[static_cast<std::size_t>(linkIndex(link))] + rng_.exponential(sc_.c2.jitter_ms);
+  c2_up_.push_back(PendingUplink{now_ms_ + static_cast<TimeMs>(std::llround(delay)), to, signature});
+  say("GMCS   uplinks the dismissal (%u) to D%d via %s", signature, drones_[static_cast<std::size_t>(to)]->spec.id, linkName(link));
+  return true;
 }
 
 // ---------------------------------------------------------------- the loop
@@ -762,6 +793,8 @@ void World::deliver() {
       const EmitterSpec& e = emitters_[static_cast<std::size_t>(rec.emitter)];
       rec.err_m = std::hypot(frame_.toEnu(rec.alert.position).e - e.e, frame_.toEnu(rec.alert.position).n - e.n);
     }
+    rec.ingest = consumer_.onAlert(rec.alert, rec.link, now_ms_);
+    if (const auto* r = consumer_.findByEvent(rec.alert.event_id)) rec.record_id = r->record_id;
     alerts_.push_back(rec);
     const bool real = rec.emitter >= 0 && emitters_[static_cast<std::size_t>(rec.emitter)].alertable;
     say("GMCS <- D%u  %-8s %s evt=%06X  pos err=%.0f m  CEP=%.0f m  conf=%.2f  sensor types=%u observers=%u  via %s  (+%.0f ms)",
@@ -863,7 +896,17 @@ TrialResult World::run() {
     for (auto& d : drones_) {
       if (d->alive && (elapsed + static_cast<TimeMs>(d->phase_ms)) % kTickMs == 0) stepDrone(*d);
     }
-    if (elapsed % 1000 == 0) observe();
+    if (elapsed % 1000 == 0) {
+      observe();
+      // The operator looks at each new GMCS record after their reaction time.
+      const auto ack_ms = static_cast<TimeMs>(sc_.c2.operator_ack_s * 1000.0);
+      for (const auto& r : consumer_.records()) {
+        if (r.state == amc8270::gmcs::RecordState::NEW && now_ms_ >= r.level_rx_ms + ack_ms) {
+          (void)consumer_.acknowledge(r.record_id, now_ms_);
+        }
+      }
+      consumer_.tick(now_ms_);
+    }
     if (!opt_.trace_path.empty() && elapsed % trace_ms == 0) traceFrame();
   }
   TrialResult r;
@@ -903,6 +946,26 @@ void World::evaluate(TrialResult& r) {
   for (auto& o : r.emitters) {  // a PRIORITY also warns: it counts as the first alert if it came first
     if (o.t_priority >= 0 && (o.t_advisory < 0 || o.t_priority < o.t_advisory)) o.t_advisory = o.t_priority;
   }
+  // What the operator ends up with after the GMCS consumer.
+  std::vector<int> per_source(emitters_.size(), 0);
+  for (const auto& rec : consumer_.records()) {
+    ++r.gmcs.records;
+    const int em = matchEmitter(rec.position, static_cast<double>(rec.cep_m));
+    if (em < 0 || !emitters_[static_cast<std::size_t>(em)].alertable) {
+      ++r.gmcs.false_records;
+    } else if (++per_source[static_cast<std::size_t>(em)] > 1) {
+      ++r.gmcs.duplicate_records;
+    }
+  }
+  r.gmcs.escalations = static_cast<int>(consumer_.stats().escalations);
+  for (const auto& a : alerts_) {
+    r.gmcs.transport_ms[linkIndex(a.link)].push_back((a.t_rx - a.t_issue) * 1000.0);
+    if (a.alert.first_seen_ms != 0) {
+      const auto lv = static_cast<std::size_t>(a.alert.level);
+      if (lv < 3) r.gmcs.detection_s[lv].push_back(a.t_rx - static_cast<double>(a.alert.first_seen_ms - kT0) / 1000.0);
+    }
+  }
+
   r.datagrams = datagrams_;
   r.datagrams_lost = lost_;
   r.bytes = bytes_;

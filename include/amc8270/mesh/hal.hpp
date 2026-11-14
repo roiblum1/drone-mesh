@@ -52,7 +52,9 @@ struct GmcsAlert {
   std::uint8_t observer_count = 0;
   DroneId issuer = kNoDrone;
   DroneId primary_verifier = kNoDrone;
-  TimeMs timestamp_ms = 0;
+  std::uint32_t signature = 0;  // e.g. RF frequency in kHz (0 = none): what a dismissal teaches the pack
+  TimeMs first_seen_ms = 0;     // when the pack first detected the source
+  TimeMs timestamp_ms = 0;      // when this drone issued the alert
 };
 
 // C2 link manager (LOS / LEO SATCOM / GEO SATCOM). Returns false if the

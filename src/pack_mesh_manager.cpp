@@ -428,6 +428,8 @@ void PackMeshManager::dispatchAlerts(TimeMs now) noexcept {
     alert.observer_count = ev.observer_count;
     alert.issuer = self_;
     alert.primary_verifier = ev.verifier[0].id;
+    alert.signature = ev.signature;
+    alert.first_seen_ms = ev.first_seen_ms;
     alert.timestamp_ms = now;
 
     if (!gmcs_.sendAlert(alert, pickLink(own_.available_links))) {

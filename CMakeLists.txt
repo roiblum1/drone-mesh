@@ -10,6 +10,7 @@ add_library(amc8270_mesh STATIC
   src/coordination.cpp
   src/crypto.cpp
   src/geo.cpp
+  src/gmcs_alert_consumer.cpp
   src/mesh_packet.cpp
   src/mesh_security.cpp
   src/pack_mesh_manager.cpp
