@@ -28,15 +28,23 @@ jobs:
       - uses: actions/checkout@v4
       - name: Unit tests
         run: make CXX=${{ matrix.cxx }} test
-      - name: Scenario simulation
-        run: make CXX=${{ matrix.cxx }} sim
+      - name: Scenario simulations (every sim/scenarios/*.scn)
+        # The sims are random processes driven by a portable generator, but the
+        # trajectory also depends on libm's last bits (sin, atan2, exp), which
+        # differ between glibc and Apple's libm. The checks are gated on Linux;
+        # macOS runs them for information.
+        run: make CXX=${{ matrix.cxx }} scenarios || [ "$RUNNER_OS" = "macOS" ]
       - name: Simulation is deterministic
         run: |
-          ./build/pack_sim > run1.txt
-          ./build/pack_sim > run2.txt
-          diff run1.txt run2.txt
+          for f in sim/scenarios/storyline6.scn sim/scenarios/pack16.scn; do
+            ./build/pack_sim --quiet "$f" > run1.txt || true
+            ./build/pack_sim --quiet "$f" > run2.txt || true
+            diff run1.txt run2.txt
+          done
       - name: Flight-library audit
         run: make audit
+      - name: Fuzz corpus replay (ASan + UBSan, this compiler)
+        run: make CXX=${{ matrix.cxx }} fuzz-regress
 
   sanitizers:
     name: ASan + UBSan
@@ -45,6 +53,43 @@ jobs:
       - uses: actions/checkout@v4
       - name: Tests and simulation under sanitizers
         run: make CXX=clang++ check
+
+  monte-carlo:
+    name: Monte Carlo smoke (20 trials per scenario)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Monte Carlo
+        run: make mc TRIALS=20
+      - name: Replay viewer from fresh traces
+        run: make replay
+      - name: Keep the distributions and the replay page
+        uses: actions/upload-artifact@v4
+        with:
+          name: monte-carlo
+          path: |
+            build/mc-*.json
+            docs/pack-mesh-replay.html
+
+  fuzz:
+    name: fuzz (libFuzzer + ASan + UBSan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clang fuzzer runtime
+        run: |
+          ver=$(clang++ --version | sed -n 's/.*clang version \([0-9]*\).*/\1/p')
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq "libclang-rt-${ver}-dev" || true
+      - name: Fuzz the decoder and receive path for 120 s
+        run: make fuzz FUZZ_SECONDS=120
+      - name: Keep any crashing input
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: build-fuzz/artifacts/
+          if-no-files-found: ignore
 
   cmake:
     name: CMake build + ctest

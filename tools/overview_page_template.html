@@ -106,6 +106,7 @@ svg.map { display: block; width: 100%; height: auto; }
 svg.map .mesh { stroke: var(--teal); stroke-width: 2.4; opacity: 0.5; }
 svg.map .route { stroke: var(--fg-2); stroke-width: 1.5; marker-end: none; }
 svg.map .bearing { stroke: var(--amber); stroke-width: 1.3; opacity: 0.9; }
+svg.map .bearing.refl { stroke-dasharray: 6 4; opacity: 0.8; }
 svg.map .oor { stroke: var(--fg-2); stroke-width: 1.1; stroke-dasharray: 4 5; opacity: 0.7; }
 svg.map .path { stroke: var(--teal); stroke-width: 2; stroke-dasharray: 7 5; }
 svg.map .ring { fill: none; stroke: var(--teal); stroke-width: 1.2; stroke-dasharray: 3 6; }
@@ -194,12 +195,12 @@ footer { margin-top: 56px; padding-top: 16px; border-top: 1px solid var(--line);
     <h1>Pack mesh</h1>
     <p class="lede">Six aircraft, one operator, and now all six are working. A peer-to-peer mesh lets every drone share what its sensors see and decide, with no leader, which of them should verify a detection.</p>
     <div class="facts" aria-label="Results from the simulated scenario">
-      <div class="fact"><b class="amber">20.1 s</b><span>Early-warning ADVISORY sent. Five drones triangulated the source to a 708 m CEP.</span></div>
-      <div class="fact"><b class="teal">328 s</b><span>Verified PRIORITY alert sent: two sensor types agree, CEP 70 m.</span></div>
-      <div class="fact"><b>1.7 kbit/s</b><span>Mean mesh traffic per drone; 3.7 kbit/s at the peak second.</span></div>
-      <div class="fact"><b>0 allocations</b><span>On the heap in the mesh loop, checked by test. 40 tests, 635 checks pass, also under ASan and UBSan.</span></div>
+      <div class="fact"><b class="amber">11.7 s</b><span>From a beacon switching on to the early-warning ADVISORY. Five drones triangulated it to a 604 m CEP.</span></div>
+      <div class="fact"><b class="teal">132 s</b><span>To the verified PRIORITY alert: two sensor types agree, CEP 69 m, actual error 24 m.</span></div>
+      <div class="fact"><b>2.2 kbit/s</b><span>Mean mesh traffic per drone; 5.0 kbit/s in the busiest second (p95 over 200 runs).</span></div>
+      <div class="fact"><b>0 allocations</b><span>On the heap in the mesh loop, checked by test. 72 tests, 1181 checks pass, also under ASan and UBSan.</span></div>
     </div>
-    <p class="src-note">Figures come from a software simulation of the mesh logic (<code>make sim</code>), not from flight tests.</p>
+    <p class="src-note">Figures come from a software simulation of the mesh logic under modelled radio fades, terrain and DF multipath (<code>make sim</code>, <code>make mc</code>), not from flight tests.</p>
   </header>
 
   <nav class="sections" aria-label="Sections">
@@ -217,42 +218,42 @@ footer { margin-top: 56px; padding-top: 16px; border-top: 1px solid var(--line);
 
   <section id="idea">
     <h2>Baseline versus mesh</h2>
-    <p class="intro">The GMCS can route the whole pack but can actively control one drone in mission mode. The other drones carry sensors and a mission computer and use neither. With the mesh, those drones scan, share and nominate verifiers on their own. The operator keeps full control of the one drone they fly.</p>
+    <p class="intro">The GMCS can route the whole pack but can actively control one drone in mission mode. The other drones carry sensors and a mission computer and use neither: the single-drone GMCS bottleneck. The mesh exploits the drones while they're under pack routing. They scan, share and nominate verifiers on their own. The operator keeps full control of the one drone they fly.</p>
     <div class="tablewrap">
       <table class="compare">
-        <thead><tr><th>Aspect</th><th>Baseline: one drone at a time</th><th>Mesh-enabled pack</th></tr></thead>
+        <thead><tr><th>Aspect</th><th>Baseline: single-drone GMCS bottleneck</th><th>Mesh-enabled pack</th></tr></thead>
         <tbody>
           <tr><td class="k">Sensor suites contributing</td><td>1 of 6</td><td>All 6 share readings; 5 of 6 can also be tasked. The controlled drone never is.</td></tr>
           <tr><td class="k">Where detections come from</td><td>Wherever the controlled drone happens to be</td><td>Anywhere along a front tens of kilometres wide</td></tr>
           <tr><td class="k">Locating an RF source</td><td>Operator flies one drone along a baseline</td><td>Several bearings arrive at once. No drone leaves formation.</td></tr>
           <tr><td class="k">Verifying a detection</td><td>One drone, one angle, after the operator re-tasks it</td><td>Best-placed drones, different angles, different sensor types</td></tr>
           <tr><td class="k">Operator workload</td><td>Detect, decide, re-task, interpret, report</td><td>One advisory, one verified alert, optional dismissal. In the scenario, zero actions to reach PRIORITY.</td></tr>
-          <tr><td class="k">What reaches the GMCS</td><td>Raw data from one drone</td><td>Fused, de-duplicated alerts</td></tr>
-          <tr><td class="k">Loss of a drone</td><td>Operator notices and re-plans</td><td>Peer times out after 5 s and its task is re-assigned (4.6 s in the scenario)</td></tr>
-          <tr><td class="k">Dependence on the C2 link</td><td>Total</td><td>Only alerts need a link, and any drone with a link can send them</td></tr>
+          <tr><td class="k">What reaches the GMCS</td><td>Raw data from one drone</td><td>Fused alerts, one per level per source, folded again into one record per source at the GMCS</td></tr>
+          <tr><td class="k">Loss of a drone</td><td>Operator notices and re-plans</td><td>Peer times out after 5 s and its task is re-assigned (5.1 s in the scenario)</td></tr>
+          <tr><td class="k">Pack independence</td><td>None: every decision waits for the operator</td><td>No leader and no C2 link needed to decide. Only alerts need a link, and any drone with a link can send them</td></tr>
         </tbody>
       </table>
     </div>
     <div class="caps">
-      <div><h3>Wide-area scanning</h3><p>Every drone keeps its direction-finder and imagers running on the route and files each reading with the pack.</p></div>
+      <div><h3>Wide-area scanning</h3><p>Every drone keeps its direction-finder and imagers running on the route and files each reading with the pack, an imager&rsquo;s once a second look confirms it.</p></div>
       <div><h3>Cooperative triangulation</h3><p>Bearings from several drones intersect by weighted least squares. Near-parallel geometry is rejected.</p></div>
-      <div><h3>Autonomous prioritisation</h3><p>Every event gets an urgency from class, novelty, confidence and freshness. All drones compute the same ranking.</p></div>
-      <div><h3>Shared learning</h3><p>An operator dismissal of a benign emitter reaches every drone, and the drone checking it is released.</p></div>
+      <div><h3>Mission task prioritisation</h3><p>Every event gets an urgency from class, novelty, confidence and freshness. All drones compute the same ranking.</p></div>
+      <div><h3>Common learning of the situation</h3><p>One shared table of benign signatures. An operator dismissal reaches every drone, and the drone checking it is released.</p></div>
       <div><h3>Verification and alerting</h3><p>The best-placed drones approach from different angles. Two sensor types must agree before a PRIORITY alert.</p></div>
     </div>
   </section>
 
   <section id="scenario">
     <h2>The simulated scenario</h2>
-    <p class="intro">Six drones fly east in a line 10 km apart. D1 is under operator control, D5 is almost out of fuel. The map is drawn to scale from the simulation's own coordinates at the moment a distress beacon switches on.</p>
+    <p class="intro">Six drones fly east in a line 10 km apart. D1 is under operator control, D5 is almost out of fuel. The radio has latency and fades, a hill hides one source, and direction-finders sometimes read a reflection. The map is drawn to scale from the simulation's own coordinates at the early warning, 11.7 s after a distress beacon switches on.</p>
     <div class="scenario">
       <div>
         <div class="mapbox">{{MAP}}</div>
         <ul class="legend">
           <li><svg viewBox="0 0 34 14"><line x1="0" y1="7" x2="34" y2="7" stroke="var(--teal)" stroke-width="2.4" opacity="0.5"/></svg>Mesh links between drones</li>
-          <li><svg viewBox="0 0 34 14"><line x1="0" y1="7" x2="34" y2="7" stroke="var(--amber)" stroke-width="1.5"/></svg>Direction-finding bearings, five drones</li>
+          <li><svg viewBox="0 0 34 14"><line x1="0" y1="7" x2="34" y2="7" stroke="var(--amber)" stroke-width="1.5"/></svg>Bearings as reported; dashed: in a multipath reflection</li>
           <li><svg viewBox="0 0 34 14"><line x1="0" y1="7" x2="34" y2="7" stroke="var(--teal)" stroke-width="2" stroke-dasharray="7 5"/></svg>Paths of the two nominated verifiers</li>
-          <li><svg viewBox="0 0 34 14"><circle cx="17" cy="7" r="6" fill="var(--amber-soft)" stroke="var(--amber)" stroke-width="1.3"/></svg>Position uncertainty (CEP 708 m, to scale)</li>
+          <li><svg viewBox="0 0 34 14"><circle cx="17" cy="7" r="6" fill="var(--amber-soft)" stroke="var(--amber)" stroke-width="1.3"/></svg>The pack&rsquo;s estimate and its CEP (604 m, to scale); the dot is the true source</li>
           <li><svg viewBox="0 0 34 14"><circle cx="17" cy="7" r="5.5" fill="var(--surface)" stroke="var(--fg)" stroke-width="3"/></svg>D1: operator-controlled, shares readings, never tasked</li>
           <li><svg viewBox="0 0 34 14"><circle cx="17" cy="7" r="5.5" fill="var(--teal)" stroke="var(--amber)" stroke-width="3"/></svg>D5: near bingo fuel, contributes bearings, never diverted</li>
           <li><svg viewBox="0 0 34 14"><circle cx="17" cy="7" r="5" fill="var(--surface)" stroke="var(--teal)" stroke-width="2.2"/></svg>Standoff points, 6 km from the source on a dashed ring</li>
@@ -263,21 +264,23 @@ footer { margin-top: 56px; padding-top: 16px; border-top: 1px solid var(--line);
         <div class="tablewrap">
           <table class="timeline">
             <tbody>
-              <tr><td>10 s</td><td>Pre-briefed weather radio detected; urgency 0.09, ignored.</td></tr>
-              <tr><td>20.0 s</td><td>Beacon switches on. Five drones hear it. D1 is 36 km away, out of range.</td></tr>
-              <tr><td>20.1 s</td><td>Bearings shared and triangulated, CEP 708 m. <b>ADVISORY</b> sent by D4 over LEO SATCOM (it has no LOS). D4 and D6 nominated, from the east and the north. D5, second-nearest, is excluded for fuel.</td></tr>
-              <tr><td>90 s</td><td>Fault injected: D4 is lost.</td></tr>
-              <tr><td>94.6 s</td><td>D6 takes the primary role. With one drone fewer the diversion budget allows one verifier.</td></tr>
-              <tr><td>100 s</td><td>Novel ISM emitter appears (urgency 0.45). It waits behind the beacon.</td></tr>
-              <tr><td>304 s</td><td>D6 closes to 10 km. IR fixes arrive and the FCS is re-pointed twice as the estimate improves.</td></tr>
-              <tr><td>328 s</td><td>Two sensor types agree: CEP 70 m, actual error 28 m. <b>PRIORITY</b> sent over LOS. D6 released.</td></tr>
-              <tr><td>420 s</td><td>Operator dismisses the ISM emitter through D1. Every drone learns it; D2, sent to check it, is released.</td></tr>
+              <tr><td>10 s</td><td>Pre-briefed weather radio detected; urgency 0.08, ignored.</td></tr>
+              <tr><td>20.0 s</td><td>Beacon switches on. D1 is 37 km away, out of DF range.</td></tr>
+              <tr><td>22.0 s</td><td>Three bearings: localised, CEP 913 m. D2 (EO, from the east) and D4 (IR, from the south-south-east) nominated. D5, second-nearest, is excluded for fuel.</td></tr>
+              <tr><td>31.7 s</td><td>Five bearings, held for 10 s: <b>ADVISORY</b> sent by D2 over LOS. CEP 604 m, 1.8 km off: D2&rsquo;s own bearing was in a reflection.</td></tr>
+              <tr><td>90 s</td><td>Fault injected: D2 is lost.</td></tr>
+              <tr><td>95.1 s</td><td>D4 takes the primary role. With one drone fewer the diversion budget allows one verifier.</td></tr>
+              <tr><td>100 s</td><td>Novel ISM emitter appears behind a hill (urgency 0.41). It waits behind the beacon.</td></tr>
+              <tr><td>151.8 s</td><td>D4&rsquo;s IR, confirmed over two looks, and the bearings agree: CEP 69 m, actual error 24 m. <b>PRIORITY</b> sent over LEO SATCOM. D4 moves on to the ISM emitter.</td></tr>
+              <tr><td>420 s</td><td>Operator dismisses the ISM emitter through D1. Every drone learns it; D4 is released.</td></tr>
             </tbody>
           </table>
         </div>
-        <p class="src-note">The five minutes between the two alerts is flight time. The mesh does not shorten the transit. It starts the right drones at once, from a position estimate good to under a kilometre, and informs the operator meanwhile.</p>
+        <p class="src-note">The two minutes between the alerts are flight time: D4 had to close to within its IR&rsquo;s 10 km range. The mesh does not shorten the transit. It starts the right drones at once, from an estimate with a CEP under a kilometre, and informs the operator meanwhile.</p>
         <h3>Is the position estimate honest?</h3>
-        <p style="color:var(--fg-2);font-size:15px">A 20,000-trial Monte Carlo at 2.5 degrees of bearing error shows about half of fixes fall inside the reported CEP, as a CEP should (49.9 to 51.5 per cent). Poor geometry has heavy tails: 2 to 6 per cent of fixes are more than three times the CEP off. That is fine for an early warning and is why PRIORITY needs a second sensor type.</p>
+        <p style="color:var(--fg-2);font-size:15px">A 20,000-trial Monte Carlo at 2.5 degrees of bearing error shows about half of fixes fall inside the reported CEP, as a CEP should (49.9 to 51.5 per cent). Poor geometry has heavy tails: 2 to 6 per cent of fixes are more than three times the CEP off. Multipath makes the tails heavier, which is why a bearing-only warning needs three bearings held for 10 s, and PRIORITY a second sensor type that the bearings confirm on their own.</p>
+        <h3>Over 200 runs</h3>
+        <p style="color:var(--fg-2);font-size:15px">The storyline was repeated 200 times with every random process reseeded, and each source moved by up to 3 km and 10 s. An early warning came in 99.5 % of runs (median 11.5 s) and a PRIORITY in 98 % (median 224 s, position error 50 m). No run raised a false PRIORITY. False early warnings came at 0.09 per drone-hour, every one a real source misplaced by multipath. The 16-drone scenario, with two beacons on one frequency, a fire, clutter, a partition and a lost verifier, also had no false PRIORITY in 200 runs.</p>
       </div>
     </div>
   </section>
@@ -294,10 +297,10 @@ footer { margin-top: 56px; padding-top: 16px; border-top: 1px solid var(--line);
     <div class="panels">
       <article class="panel"><span class="n">PANEL 1</span><h3>One operator. One working sensor.</h3><p>Today, only one aircraft is on the job. The rest fly the route with their sensors and processors idle.</p><p class="vis">Six UAVs line abreast over open terrain, one with a bright ring, five dimmed, a faint route line ahead.</p><span class="chip">1 of 6 sensor suites in use</span></article>
       <article class="panel"><span class="n">PANEL 2</span><h3>The mesh wakes the pack</h3><p>Every aircraft listens and shares. Peer-to-peer links, run by the Model 8270 on each drone, turn route-flyers into a distributed sensor.</p><p class="vis">Teal halos, thin teal arcs between neighbours with packet dots, a faint sensor sweep under each aircraft.</p><span class="chip">6 of 6 sensor suites contributing</span></article>
-      <article class="panel"><span class="n">PANEL 3</span><h3>One hears it. All of them know.</h3><p>The first bearing is shared in the next mesh cycle. No operator in the loop yet.</p><p class="vis">An amber glow on the ground at a forest edge. One sweep clips it and an amber line draws down.</p><span class="chip">Shared within one 0.1 s mesh cycle (simulated)</span></article>
-      <article class="panel"><span class="n">PANEL 4</span><h3>Five drones triangulate what one could only hear</h3><p>Bearing-only readings from several vantage points fuse into a position with no drone leaving formation.</p><p class="vis">Four more amber lines converge. A translucent ellipse tightens around the glow.</p><span class="chip">5 observers, CEP 0.7 km, early warning sent</span></article>
+      <article class="panel"><span class="n">PANEL 3</span><h3>One hears it. All of them know.</h3><p>The first bearing is shared at once. No operator in the loop yet.</p><p class="vis">An amber glow on the ground at a forest edge. One sweep clips it and an amber line draws down.</p><span class="chip">Shared at once, re-sent every 2 s</span></article>
+      <article class="panel"><span class="n">PANEL 4</span><h3>Five drones triangulate what one could only hear</h3><p>Bearing-only readings from several vantage points fuse into a position with no drone leaving formation.</p><p class="vis">Four more amber lines converge. A translucent ellipse tightens around the glow.</p><span class="chip">5 observers, CEP 0.6 km, early warning in 12 s</span></article>
       <article class="panel"><span class="n">PANEL 5</span><h3>The pack decides who goes. The rest keep watching.</h3><p>Chosen by time to target, sensor type, fuel margin and viewing angle. At most two fifths of the pack ever leave the route.</p><p class="vis">Two aircraft bank away on different headings; the others fly on. One carries a small fuel icon.</p><span class="chip">2 verifiers, different angles, 3 keep scanning</span></article>
-      <article class="panel"><span class="n">PANEL 6</span><h3>The operator gets an answer, not a stream.</h3><p>Two sensor types confirm the position. One compact alert goes up over the best available link.</p><p class="vis">The ellipse collapses to a dot. A white packet climbs to LEO, then GEO, then down to a ground control centre.</p><span class="chip">PRIORITY alert, CEP 70 m, 1.7 kbit/s mean mesh load</span></article>
+      <article class="panel"><span class="n">PANEL 6</span><h3>The operator gets an answer, not a stream.</h3><p>Two sensor types confirm the position. One compact alert goes up over the best available link.</p><p class="vis">The ellipse collapses to a dot. A white packet climbs to LEO, then GEO, then down to a ground control centre.</p><span class="chip">PRIORITY alert, CEP 70 m, 2.2 kbit/s mean mesh load</span></article>
     </div>
   </section>
 
@@ -317,20 +320,20 @@ footer { margin-top: 56px; padding-top: 16px; border-top: 1px solid var(--line);
       <table>
         <thead><tr><th>ID</th><th>Link</th><th>Bus</th><th>Carries</th></tr></thead>
         <tbody>
-          <tr><td class="id">I1</td><td>Mesh transceiver and AMC</td><td class="bus">Gigabit Ethernet, UDP multicast</td><td>Mesh frames, 160 bytes at most</td></tr>
-          <tr><td class="id">I2</td><td>AMC time service to mesh radio</td><td class="bus">1 PPS, RS-422</td><td>Time pulse for slot timing</td></tr>
+          <tr><td class="id">I1</td><td>Mesh Network Transceiver and AMC</td><td class="bus">Gigabit Ethernet, UDP multicast</td><td>Mesh frames, 160 bytes at most</td></tr>
+          <tr><td class="id">I2</td><td>AMC time service to Mesh Network Transceiver</td><td class="bus">1 PPS, RS-422</td><td>Time pulse for slot timing</td></tr>
           <tr><td class="id">I4</td><td>LOS, LEO, GEO terminals and AMC</td><td class="bus">Gigabit Ethernet</td><td>Alerts, mission data, downlinked imagery</td></tr>
           <tr><td class="id">I5</td><td>C2 terminals to FCS</td><td class="bus">RS-422, dual</td><td><b>Flight commands, direct, not through the AMC</b></td></tr>
           <tr><td class="id">I6</td><td>AMC and C2 terminals</td><td class="bus">RS-422 / RS-485</td><td>Link state, antenna control, active-link selection</td></tr>
-          <tr><td class="id">I7</td><td>RF direction-finder and AMC</td><td class="bus">Gigabit Ethernet</td><td>Bearing reports; IQ on demand</td></tr>
-          <tr><td class="id">I8</td><td>EO/IR gimbal and AMC</td><td class="bus">Gigabit Ethernet, RS-422</td><td>Video, geolocated fixes, cueing</td></tr>
-          <tr><td class="id">I9</td><td>Anomaly detectors and AMC</td><td class="bus">CAN 2.0B or RS-485</td><td>Events, status</td></tr>
-          <tr><td class="id">I10</td><td>Payload power unit and AMC</td><td class="bus">CAN 2.0B</td><td>Power state, faults, on/off commands</td></tr>
+          <tr><td class="id">I7</td><td>Variable Homing Devices bus: RF direction-finder</td><td class="bus">Gigabit Ethernet</td><td>Bearing reports; IQ on demand</td></tr>
+          <tr><td class="id">I8</td><td>Variable Homing Devices bus: EO/IR gimbal</td><td class="bus">Gigabit Ethernet, RS-422</td><td>Video, geolocated fixes, cueing</td></tr>
+          <tr><td class="id">I9</td><td>Variable Homing Devices bus: anomaly detectors</td><td class="bus">CAN 2.0B or RS-485</td><td>Events, status</td></tr>
+          <tr><td class="id">I10</td><td>Variable Homing Devices bus: payload power unit</td><td class="bus">CAN 2.0B</td><td>Power state, faults, on/off commands</td></tr>
           <tr><td class="id">I11</td><td>AMC and FCS</td><td class="bus">RS-422, dual (1553B optional)</td><td>Requests and cancels one way; mode, corridor, accept or refuse, health the other</td></tr>
           <tr><td class="id">I12</td><td>INS/GNSS to AMC and FCS</td><td class="bus">RS-422, 100 to 200 Hz</td><td>Position, velocity, attitude</td></tr>
           <tr><td class="id">I13</td><td>INS/GNSS to AMC time service</td><td class="bus">1 PPS + time of day</td><td>UTC time base</td></tr>
-          <tr><td class="id">I14</td><td>EMU and FCS</td><td class="bus">CAN 2.0B / CANaerospace</td><td>Engine control and status</td></tr>
-          <tr><td class="id">I15</td><td>EMU to AMC</td><td class="bus">CAN 2.0B, listen-only</td><td>Fuel flow and quantity, giving the endurance against the 7 h nominal</td></tr>
+          <tr><td class="id">I14</td><td>7-hour combustion EMU and FCS</td><td class="bus">CAN 2.0B / CANaerospace</td><td>Engine control and status</td></tr>
+          <tr><td class="id">I15</td><td>7-hour combustion EMU to AMC</td><td class="bus">CAN 2.0B, listen-only</td><td>Fuel flow and quantity, giving the endurance against the 7 h nominal</td></tr>
         </tbody>
       </table>
     </div>
@@ -338,13 +341,13 @@ footer { margin-top: 56px; padding-top: 16px; border-top: 1px solid var(--line);
 
   <section id="algorithm">
     <h2>How the pack decides</h2>
-    <p class="intro">No leader. Every drone folds the same readings into the same table and computes the same plan. Drones with the same table agree without negotiating.</p>
+    <p class="intro">Pack independence: no leader. Every drone folds the same readings into the same table and computes the same plan. Drones with the same table agree without negotiating.</p>
     <ol class="steps">
-      <li><span><b>Share.</b> Each drone broadcasts a heartbeat at 1 Hz (position, fuel, active sensor, mode, task) and each sensor reading as it happens. Own readings are re-sent every 2 s so a lost packet only delays convergence.</span></li>
-      <li><span><b>Fuse.</b> Readings are keyed by observer and sensor and kept in sorted order. Bearings intersect into a position; duplicate events merge into the lowest id.</span></li>
+      <li><span><b>Share.</b> Each drone broadcasts a heartbeat at 1 Hz (position, fuel, active sensor, mode, task) and each sensor reading as it happens; an imager&rsquo;s once a second look confirms it. Own readings are re-sent every 2 s so a lost packet only delays convergence.</span></li>
+      <li><span><b>Fuse.</b> Every refresh re-clusters all readings in a canonical order, so the grouping and the event ids depend only on the readings, not on arrival order. Bearings intersect into a position; an event takes the lowest id its readings carry.</span></li>
       <li><span><b>Rank.</b> <code>evaluateAndCoordinateAlerts()</code> runs every 0.5 s on every drone and ranks events by urgency.</span></li>
       <li><span><b>Nominate.</b> For each event the best-fitting free drones are chosen. A drone that finds itself in the plan sends a request to the FCS and claims its slot on the mesh. Claims are arbitrated by quantised score, ties by lowest id, so the holder never depends on arrival order.</span></li>
-      <li><span><b>Alert.</b> ADVISORY once an event is localised well enough, PRIORITY once two sensor types agree. One drone is the owner, with ranked backups. The GMCS also de-duplicates by event id.</span></li>
+      <li><span><b>Alert.</b> ADVISORY once an event is localised well enough, PRIORITY once two sensor types agree. One drone is the owner, with ranked backups. At the GMCS an alert consumer folds duplicates by id and by place, tracks acknowledgement and sends dismissals back to the pack.</span></li>
     </ol>
     <div class="two">
       <div>
@@ -357,7 +360,7 @@ fit = 0.40 x time to standoff
     + 0.25 x new sensor type
     + 0.15 x fuel margin
     + 0.20 x viewing-angle spread
-    <span class="dim">+ 0.15 if already the verifier</span></pre>
+    <span class="dim">+ 0.30 if already in this slot</span></pre>
         <div class="tablewrap"><table>
           <thead><tr><th>Class</th><th class="num">Severity</th></tr></thead>
           <tbody><tr><td>Distress beacon</td><td class="num">1.0</td></tr><tr><td>Thermal hazard</td><td class="num">0.9</td></tr><tr><td>Anomaly</td><td class="num">0.7</td></tr><tr><td>Unclassified RF emitter</td><td class="num">0.5</td></tr><tr><td>Unknown</td><td class="num">0.4</td></tr></tbody>
@@ -375,9 +378,11 @@ budget:    at most floor(0.4 x free drones),
 verifiers: 2 if urgency >= 0.6, else 1
 
 ADVISORY:  severity >= 0.7, confidence >= 0.6,
-           CEP <= 2 km
+           CEP <= 2 km; from bearings alone,
+           >= 3 bearings, held for 10 s
 PRIORITY:  confidence >= 0.9, CEP <= 250 m,
-           >= 2 observers, >= 2 sensor types</pre>
+           >= 2 observers, >= 2 sensor types;
+           >= 3 bearings agree on their own</pre>
         <p style="color:var(--fg-2);font-size:15px">Confidence is a noisy-OR of the readings, capped at 0.85 for one sensor type and 0.99 for two or more. A single sensor type can never confirm an event.</p>
       </div>
     </div>
@@ -385,7 +390,7 @@ PRIORITY:  confidence >= 0.9, CEP <= 250 m,
 
   <section id="code">
     <h2>Embedded C++17</h2>
-    <p class="intro">Flight-library rules: no exceptions or RTTI, no heap allocation after construction, bounded loops, explicit little-endian wire format. <code>make audit</code> fails the build if the library uses <code>new</code>, <code>throw</code>, <code>std::vector</code> and similar. One <code>PackMeshManager</code> is about 60 KB of fixed storage.</p>
+    <p class="intro">Flight-library rules: no exceptions or RTTI, no heap allocation after construction, bounded loops, explicit little-endian wire format. <code>make audit</code> fails the build if the library uses <code>new</code>, <code>throw</code>, <code>std::vector</code> and similar. One <code>PackMeshManager</code> is about 128 KB of fixed storage.</p>
     <details class="code" open><summary>evaluateAndCoordinateAlerts<span class="path">src/pack_mesh_manager.cpp</span></summary><pre>{{CODE_EVAL}}</pre></details>
     <details class="code"><summary>DroneState<span class="path">include/amc8270/mesh/drone_state.hpp</span></summary><pre>{{CODE_STATE}}</pre></details>
     <details class="code"><summary>DetectedEvent<span class="path">include/amc8270/mesh/detected_event.hpp</span></summary><pre>{{CODE_EVENT}}</pre></details>
@@ -405,14 +410,17 @@ PRIORITY:  confidence >= 0.9, CEP <= 250 m,
     <h2>Not done yet</h2>
     <p class="intro">Read these before relying on any of this.</p>
     <ul class="open">
-      <li><b>No authentication or encryption.</b><span>Packets carry a CRC, which catches accidents but not an attacker. A real mesh needs authenticated encryption, key management and replay protection.</span></li>
-      <li><b>No flight validation.</b><span>Every performance figure comes from a simulation with idealised sensors, zero radio latency and a range limited only by distance.</span></li>
+      <li><b>The cipher is not a validated module.</b><span>Frames are sealed with ChaCha20-Poly1305, implemented from RFC 8439 and vector-tested. A fielded system needs a validated module behind the same interface.</span></li>
+      <li><b>Insiders can forge within an epoch.</b><span>Keys are symmetric. A captured drone can forge frames in any member's name until the GMCS revokes it and re-keys the pack without it.</span></li>
+      <li><b>No flight validation.</b><span>Every performance figure comes from a simulation. Its radio, terrain, multipath and clutter models are generic, not measured on the real radio, DF or airframe.</span></li>
+      <li><b>The mesh does not relay.</b><span>Every frame is one hop. A pack wider than the radio range splits into groups that each alert on their own.</span></li>
       <li><b>The 8270's real interfaces are assumed.</b><span>All hardware access goes through one abstraction layer. The buses in the diagram are recommendations.</span></li>
       <li><b>The FCS interface has no reply.</b><span>A real one needs accept and refuse.</span></li>
       <li><b>Time assumes a shared GNSS-disciplined clock.</b><span>GNSS-denied operation is not handled.</span></li>
       <li><b>The corridor is a circle.</b><span>A real approved corridor is a polygon.</span></li>
-      <li><b>Forged packets.</b><span>Packets naming another drone as sender, future timestamps and absurd values are rejected, but a forged frequency dismissal or alert notice still works without authentication.</span></li>
-      <li><b>Mesh partitions are untested.</b><span>Each side of a split keeps working by design and the GMCS de-duplicates alerts, but no test covers it.</span></li>
+      <li><b>A pack member can still lie in its own name.</b><span>Authentication proves who sent a frame, not that it is true. Content checks limit the damage and revocation removes the drone.</span></li>
+      <li><b>Persistent clutter is not modelled.</b><span>One-frame false detections are removed by a second look. A false detection that persists, such as a sun-heated rock, could still raise an ADVISORY, and with bearings that happen to cross near it, a PRIORITY.</span></li>
+      <li><b>A partition doubles the alerts.</b><span>Each side of a split alerts under its own id. After the heal the pack converges on one event and stays quiet; the GMCS alert consumer folds the second alert into the first record.</span></li>
     </ul>
     <footer>
       <span>The system detects, localises, verifies and alerts. It has no weapons or engagement logic and does not command flight controls: it sends requests to the FCS.</span>

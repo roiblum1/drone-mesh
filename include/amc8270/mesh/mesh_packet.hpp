@@ -1,11 +1,16 @@
-// Mesh wire format. Explicit little-endian serialisation (no struct memcpy),
-// CRC-32 over header + payload, strict validation of every field on decode.
+// Mesh wire format, version 2: every frame is authenticated and encrypted.
 //
-//  0      2     3     4      6     8       12        20          20+len   +4
-//  +------+-----+-----+------+-----+-------+---------+-----------+--------+
-//  |magic |ver  |type |src   |len  |seq    |time_ms  |payload    |crc32   |
-//  |0x8270|1    |1..6 |u16   |u16  |u32    |u64      |len bytes  |u32     |
-//  +------+-----+-----+------+-----+-------+---------+-----------+--------+
+//  0      2    3     4     6       8         12      16     18             18+len   +16
+//  +------+----+-----+-----+-------+---------+-------+------+--------------+--------+
+//  |magic |ver |flags|src  |epoch  |session  |seq    |len   |ciphertext    |tag     |
+//  |0x8270|2   |0    |u16  |u16    |u32      |u32    |u16   |len bytes     |16 B    |
+//  +------+----+-----+-----+-------+---------+-------+------+--------------+--------+
+//   \_____________ clear, authenticated as AAD ____________/ \__ChaCha20__/ Poly1305
+//
+// The ciphertext is the body: type u8, time_ms u64, then the payload. Fields
+// are written explicitly little-endian (no struct copies onto the wire) and
+// every field is validated on decode. This header holds the plaintext codec;
+// mesh_security.hpp seals and opens whole frames.
 #pragma once
 
 #include <cstddef>
@@ -19,9 +24,11 @@
 namespace amc8270::mesh {
 
 inline constexpr std::uint16_t kPacketMagic = 0x8270;
-inline constexpr std::uint8_t kPacketVersion = 1;
-inline constexpr std::size_t kHeaderBytes = 20;
-inline constexpr std::size_t kCrcBytes = 4;
+inline constexpr std::uint8_t kPacketVersion = 2;
+inline constexpr std::size_t kFrameHeaderBytes = 18;
+inline constexpr std::size_t kFrameTagBytes = 16;
+inline constexpr std::size_t kBodyHeaderBytes = 9;  // type u8 + time_ms u64
+inline constexpr std::size_t kMaxBodyBytes = kMaxPacketBytes - kFrameHeaderBytes - kFrameTagBytes;
 
 enum class MsgType : std::uint8_t {
   HEARTBEAT = 1,         // peer discovery + state sync (position, fuel, sensor, mode)
@@ -57,8 +64,10 @@ struct LeavePayload {};
 
 struct PacketHeader {
   DroneId src = kNoDrone;
-  std::uint32_t seq = 0;  // per-sender, shared by all types (gap = loss)
-  TimeMs time_ms = 0;
+  std::uint16_t epoch = 0;    // key epoch the frame was sealed under
+  std::uint32_t session = 0;  // sender's boot session; never repeats for a drone
+  std::uint32_t seq = 0;      // per session, shared by all types (gap = loss)
+  TimeMs time_ms = 0;         // sender's clock at send time (inside the ciphertext)
 };
 
 // Variant index == MsgType value; index 0 (monostate) means "empty".
@@ -71,15 +80,30 @@ struct MeshPacket {
   MsgType type() const noexcept { return static_cast<MsgType>(payload.index()); }
 };
 
-// Largest encoded frame is an OBSERVATION: 20 + 61 + 4 = 85 bytes.
-static_assert(kHeaderBytes + 61 + kCrcBytes <= kMaxPacketBytes, "kMaxPacketBytes must hold an OBSERVATION frame");
+// Largest body is an OBSERVATION: 9 + 61 = 70 bytes, so a frame is at most 104.
+static_assert(kBodyHeaderBytes + 61 <= kMaxBodyBytes, "kMaxPacketBytes must hold a sealed OBSERVATION frame");
 
-[[nodiscard]] std::uint32_t crc32(const std::uint8_t* data, std::size_t len) noexcept;
+// The clear part of a frame.
+struct FrameHeader {
+  DroneId src = kNoDrone;
+  std::uint16_t epoch = 0;
+  std::uint32_t session = 0;
+  std::uint32_t seq = 0;
+  std::uint16_t body_len = 0;  // ciphertext bytes, excluding the tag
+};
 
-// Returns the encoded size, or 0 if the packet is empty or does not fit.
-[[nodiscard]] std::size_t encodePacket(const MeshPacket& pkt, std::uint8_t* buf, std::size_t cap) noexcept;
+void writeFrameHeader(const FrameHeader& h, std::uint8_t* out18) noexcept;
+// False unless magic, version, flags, src, session, seq and the length all check
+// out against `len`, the size of the whole datagram.
+[[nodiscard]] bool parseFrameHeader(const std::uint8_t* buf, std::size_t len, FrameHeader& out) noexcept;
 
-// False on any framing, CRC, range or finiteness violation; `out` is then unspecified.
-[[nodiscard]] bool decodePacket(const std::uint8_t* buf, std::size_t len, MeshPacket& out) noexcept;
+// Plaintext body: type, time_ms, payload. Returns the size, or 0 if the packet
+// is empty or does not fit.
+[[nodiscard]] std::size_t encodeBody(const MeshPacket& pkt, std::uint8_t* buf, std::size_t cap) noexcept;
+
+// False on any framing, range or finiteness violation, or a heartbeat that
+// describes a drone other than `src`. Sets out.header.src and time_ms; the
+// other header fields are left for the caller. `out` is unspecified on failure.
+[[nodiscard]] bool decodeBody(const std::uint8_t* buf, std::size_t len, DroneId src, MeshPacket& out) noexcept;
 
 }  // namespace amc8270::mesh

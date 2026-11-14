@@ -1,0 +1,50 @@
+# The original 6-drone storyline with the original, idealised models: no
+# radio latency, independent 5 % loss, flat ground, no multipath, no clutter.
+# Kept so the earlier documented numbers can be reproduced.
+#
+# Pack: D1 is under operator control (ACTIVE_MISSION); D2..D6 fly the route
+# passively (PACK_ROUTING), 10 km apart, line abreast, heading east. D5 is
+# almost at bingo fuel; D4 has no LOS link. Three RF sources appear:
+#   406.025 MHz distress beacon + thermal source  -> real event
+#   433.920 MHz ISM emitter                        -> novel, later dismissed
+#   162.550 MHz weather radio                      -> pre-briefed benign
+# A verifier is lost mid-transit to exercise re-assignment.
+name     ideal6
+duration 600
+seed     1
+origin   36.0 -12.0
+altitude 3000
+speeds   40 45 55
+
+radio    range_km 60 latency_ms 0 jitter_ms 0 loss_good 0.05 loss_bad 0.05 p_gb 0 p_bg 1
+df       range_km 35 sigma_deg 2.5 period_s 2
+imaging  passive_km 3 cued_km 10 sigma_m 45 cep_m 70
+c2       los_ms 60 leo_ms 180 geo_ms 650 jitter_ms 30 ack_s 8
+
+#     id mode   sensors   links        endur_h  e_km  n_km  [bingo_s]
+drone 1  ACTIVE RF+EO+IR  LOS+LEO+GEO  3.5      0     -25
+drone 2  ROUTE  RF+EO     LOS+LEO+GEO  4.0      0     -15
+drone 3  ROUTE  RF+IR     LOS+LEO+GEO  4.5      0     -5
+drone 4  ROUTE  RF+IR+AN  LEO+GEO      4.1      0     5
+drone 5  ROUTE  RF+EO     LOS+LEO+GEO  0.5556   0     15    1800
+drone 6  ROUTE  RF+IR     LOS+LEO+GEO  4.2      0     25
+
+#       label   sig     e_km  n_km  on_s  class            options
+emitter beacon  406025  16    8     20    DISTRESS_BEACON  thermal
+emitter ism     433920  30    -12   100   RF_EMITTER
+emitter wx      162550  22    30    10    RF_EMITTER
+benign  162550
+
+at 90  lose_verifier beacon
+at 420 dismiss ism
+
+expect advisory_once beacon
+expect priority_once beacon 150
+expect priority_after_advisory beacon
+expect never_tasked 1
+expect never_tasked 5
+expect reassigned_after_loss beacon
+expect quiet wx
+expect dismissal_learned ism
+expect all_released
+expect max_fcs_requests 6

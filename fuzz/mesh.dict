@@ -1,0 +1,15 @@
+# libFuzzer dictionary for fuzz_packet: frame magic and version, message types,
+# a plausible timestamp (1.7e12 ms, little-endian) and common signatures.
+magic="\x70\x82"
+version="\x02"
+type_heartbeat="\x01"
+type_observation="\x02"
+type_claim="\x03"
+type_alert="\x04"
+type_signature="\x05"
+type_leave="\x06"
+t0="\x00\x68\xe5\xcf\x8b\x01\x00\x00"
+sig_406025="\x09\x32\x06\x00"
+sig_433920="\x00\x9f\x06\x00"
+float_one="\x00\x00\x80\x3f"
+float_half="\x00\x00\x00\x3f"

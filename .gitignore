@@ -1,3 +1,6 @@
 build/
 build-san/
+build-cmake/
+build-fuzz/
 .playwright-mcp/
+__pycache__/

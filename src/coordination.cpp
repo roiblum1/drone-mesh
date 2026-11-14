@@ -40,10 +40,42 @@ float computeUrgency(const DetectedEvent& ev, bool benign, TimeMs now, const Mes
   return static_cast<float>(sev * novelty * (0.3 + 0.7 * conf) * (0.5 + 0.5 * fresh));
 }
 
+namespace {
+
+// Order among events on one frequency: more observers, then higher confidence, then lower id.
+bool betterSupported(const DetectedEvent& a, const DetectedEvent& b) noexcept {
+  if (a.observer_count != b.observer_count) return a.observer_count > b.observer_count;
+  if (a.confidence != b.confidence) return a.confidence > b.confidence;
+  return a.id < b.id;
+}
+
+// Bearings only, and too few to stand on their own: unlocalised, or fewer than
+// advisory_min_bearings (the same bar a bearing-only ADVISORY has to clear).
+bool thinBearingOnly(const DetectedEvent& ev, const MeshConfig& cfg) noexcept {
+  if (!ev.localized) return true;
+  unsigned bearings = 0;
+  for (const auto& o : ev.observations) {
+    if (o.has_fix) return false;
+    ++bearings;
+  }
+  return bearings < cfg.advisory_min_bearings;
+}
+
+}  // namespace
+
 void updateUrgencies(SituationalAwarenessTable& table, TimeMs now) noexcept {
   const MeshConfig& cfg = table.config();
-  for (auto& ev : table.mutableEvents()) {
+  auto& events = table.mutableEvents();
+  for (auto& ev : events) {
     ev.urgency = computeUrgency(ev, table.isBenign(ev.signature), now, cfg);
+    if (ev.signature == 0) continue;
+    for (const auto& other : events) {
+      if (&other == &ev || other.signature != ev.signature || !other.localized) continue;
+      if (betterSupported(other, ev)) {
+        ev.urgency = static_cast<float>(static_cast<double>(ev.urgency) * cfg.secondary_source_novelty);
+        break;
+      }
+    }
   }
 }
 
@@ -163,6 +195,20 @@ void planAssignments(const SituationalAwarenessTable& table, const DroneList& dr
   for (std::size_t k = 0; k < n_events && used < budget; ++k) {
     const DetectedEvent& ev = events[order[k]];
     if (!eligibleForTasking(ev, now, cfg)) continue;
+    // A lone bearing, or a crossing of fewer than advisory_min_bearings bearings, on
+    // a frequency the pack has localised better elsewhere is that source mid-update
+    // or a reflection, not worth an aircraft: two lines always cross somewhere, and
+    // two reflected bearings on a confirmed beacon's frequency made such ghosts in the
+    // realistic simulation. The better-supported event is tasked; a lone bearing
+    // alone on its frequency still gets a look along it.
+    if (ev.signature != 0 && thinBearingOnly(ev, cfg)) {
+      bool sibling = false;
+      for (const auto& other : events) {
+        sibling = sibling ||
+                  (&other != &ev && other.localized && other.signature == ev.signature && betterSupported(other, ev));
+      }
+      if (sibling) continue;
+    }
 
     const std::size_t want = std::min<std::size_t>(ev.urgency >= cfg.dual_verifier_urgency ? 2 : 1, budget - used);
     std::array<double, 2> chosen{};
@@ -182,7 +228,10 @@ void planAssignments(const SituationalAwarenessTable& table, const DroneList& dr
         }
         for (std::size_t c = 0; c < n_chosen; ++c) cov[nc++] = chosen[c];
 
-        const bool incumbent = ev.verifier[0].id == d.id || ev.verifier[1].id == d.id;
+        // Incumbency is per slot: the current primary keeps the primary role and the current
+        // secondary the secondary one, so two verifiers with close scores do not trade roles
+        // (and re-point both aircraft) every few seconds.
+        const bool incumbent = ev.verifier[slot].id == d.id;
         Suitability s;
         if (!computeSuitability(d, ev, cov.data(), nc, incumbent, cfg, s)) continue;
         if (best < 0 || s.score > best_s.score + 1.0e-6f) {  // ties keep the lower drone id
@@ -244,15 +293,63 @@ void applyAssignments(SituationalAwarenessTable& table, const AssignmentList& pl
   }
 }
 
-AlertLevel evaluateAlertLevel(const DetectedEvent& ev, bool benign, const MeshConfig& cfg) noexcept {
+// Sensor types that each place the source on their own, where the event says
+// it is. An imager's fix does by itself. Bearings do only if, without the
+// fixes, at least priority_min_bearings of them triangulate to the same spot
+// with a usable CEP, counting only bearings that no other localised event on
+// the frequency explains better. A line passing near some fix (a clutter
+// detection, say) fits every point along it and confirms nothing; nor does a
+// bearing that belongs to another source on the same frequency.
+unsigned corroboratingModalities(const SituationalAwarenessTable* table, const DetectedEvent& ev,
+                                 const MeshConfig& cfg) noexcept {
+  SensorMask mask = 0;
+  DetectedEvent lines;
+  for (const auto& o : ev.observations) {
+    if (o.has_fix) {
+      const double gate = cfg.association_gate_m +
+                          cfg.association_cep_factor * (static_cast<double>(o.fix_cep_m) + static_cast<double>(ev.cep_m));
+      if (distanceM(o.fix, ev.position) <= gate) mask = static_cast<SensorMask>(mask | maskOf(o.sensor));
+      continue;
+    }
+    bool explained_elsewhere = false;
+    if (table != nullptr && o.signature != 0) {
+      const double here = table->bearingGateRatio(o, ev);
+      for (const auto& other : table->events()) {
+        if (other.id == ev.id || !other.localized || other.signature != o.signature) continue;
+        if (table->bearingGateRatio(o, other) < here) explained_elsewhere = true;
+      }
+    }
+    if (!explained_elsewhere) (void)lines.observations.push_back(o);  // fits: a subset of ev's readings
+  }
+  if (lines.observations.size() >= cfg.priority_min_bearings) {
+    fuseEvent(lines, cfg);
+    const double gate = cfg.association_gate_m + cfg.association_cep_factor * static_cast<double>(ev.cep_m);
+    if (lines.localized && static_cast<double>(lines.cep_m) <= cfg.advisory_max_cep_m &&
+        distanceM(lines.position, ev.position) <= gate) {
+      mask = static_cast<SensorMask>(mask | maskOf(SensorType::RF_DF));
+    }
+  }
+  return popCount(mask);
+}
+
+AlertLevel evaluateAlertLevel(const DetectedEvent& ev, bool benign, const MeshConfig& cfg,
+                              const SituationalAwarenessTable* table) noexcept {
   if (benign || ev.status == EventStatus::DISMISSED || !ev.localized) return AlertLevel::NONE;
   const double sev = static_cast<double>(eventSeverity(ev.cls));
   if (sev < cfg.advisory_min_severity) return AlertLevel::NONE;
+  unsigned bearings = 0;
+  bool fix = false;
+  for (const auto& o : ev.observations) {
+    bearings += o.has_fix ? 0U : 1U;
+    fix = fix || o.has_fix;
+  }
+  if (!fix && bearings < cfg.advisory_min_bearings) return AlertLevel::NONE;  // two crossing lines prove nothing
   const double conf = static_cast<double>(ev.confidence);
   const double cep = static_cast<double>(ev.cep_m);
 
   if (conf >= cfg.priority_min_conf && cep <= cfg.priority_max_cep_m &&
-      ev.observer_count >= cfg.priority_min_observers && popCount(ev.modality_mask) >= cfg.priority_min_modalities) {
+      ev.observer_count >= cfg.priority_min_observers && popCount(ev.modality_mask) >= cfg.priority_min_modalities &&
+      corroboratingModalities(table, ev, cfg) >= cfg.priority_min_modalities) {
     return AlertLevel::PRIORITY;
   }
   if (conf >= cfg.advisory_min_conf && cep <= cfg.advisory_max_cep_m) return AlertLevel::ADVISORY;

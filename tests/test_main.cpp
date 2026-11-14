@@ -10,11 +10,15 @@
 #include <memory>
 #include <new>
 
+#include "amc8270/gmcs/alert_consumer.hpp"
+#include "amc8270/mesh/crypto.hpp"
 #include "amc8270/mesh/geo.hpp"
+#include "amc8270/mesh/mesh_security.hpp"
 #include "amc8270/mesh/pack_mesh_manager.hpp"
 #include "amc8270/mesh/validation.hpp"
 
 using namespace amc8270::mesh;
+namespace gmcs = amc8270::gmcs;
 
 // ---------------------------------------------------------------- heap probe
 static std::size_t g_allocs = 0;
@@ -43,7 +47,7 @@ struct TestCase {
   const char* name;
   void (*fn)();
 };
-static std::array<TestCase, 64> g_tests{};
+static std::array<TestCase, 128> g_tests{};
 static std::size_t g_n_tests = 0;
 struct Registrar {
   Registrar(const char* n, void (*f)()) { g_tests[g_n_tests++] = {n, f}; }
@@ -59,6 +63,15 @@ static GeoPoint enu(double e, double n, float alt = 3000.0f) {
   static const LocalFrame frame(kOrigin);
   return frame.fromEnu(Vec2{e, n}, alt);
 }
+
+// Test keys only. Byte pattern makes two keys with different seeds differ everywhere.
+static crypto::Key testKey(std::uint8_t seed) {
+  crypto::Key k{};
+  for (std::size_t i = 0; i < k.size(); ++i) k[i] = static_cast<std::uint8_t>(seed * 31U + i * 7U + 1U);
+  return k;
+}
+static const crypto::Key kPackKey = testKey(1);
+constexpr std::uint16_t kPackEpoch = 1;
 
 struct FakeClock : IClock {
   TimeMs now = 1'700'000'000'000ULL;
@@ -99,9 +112,15 @@ class Bus {
   }
 
   bool broadcastFrom(int src, const std::uint8_t* d, std::size_t n) {
+    if (src == record_src && tape_n < tape.size()) {
+      std::memcpy(tape[tape_n].data.data(), d, n);
+      tape[tape_n].len = n;
+      ++tape_n;
+    }
     if (isolated[static_cast<std::size_t>(src)]) return true;
     for (int dst = 0; dst < kMaxNodes; ++dst) {
       if (dst == src || isolated[static_cast<std::size_t>(dst)]) continue;
+      if (group[static_cast<std::size_t>(dst)] != group[static_cast<std::size_t>(src)]) continue;
       if (drop_permille != 0) {
         rng ^= rng << 13;
         rng ^= rng >> 17;
@@ -120,7 +139,13 @@ class Bus {
 
   std::array<Node, kMaxNodes> nodes{};
   std::array<bool, kMaxNodes> isolated{};
+  // Nodes in different groups cannot hear each other (a mesh partition).
+  std::array<int, kMaxNodes> group{};
   unsigned drop_permille = 0;
+  // Every datagram node `record_src` sends is also copied onto the tape.
+  int record_src = -1;
+  std::array<Datagram, 128> tape{};
+  std::size_t tape_n = 0;
   std::uint32_t rng = 2463534242u;
 };
 
@@ -165,8 +190,17 @@ struct Pack {
   explicit Pack(std::size_t count, const MeshConfig& cfg = MeshConfig{}) : n(count) {
     for (std::size_t i = 0; i < n; ++i) {
       const std::size_t k = i;
-      mgr[i] = std::make_unique<PackMeshManager>(static_cast<DroneId>(i + 1), cfg, clock, bus.nodes[k], gmcs[k], guidance[k]);
+      mgr[i] = std::make_unique<PackMeshManager>(static_cast<DroneId>(i + 1), cfg, 1U, clock, bus.nodes[k], gmcs[k],
+                                                 guidance[k]);
+      if (!mgr[i]->installEpochKey(kPackEpoch, kPackKey, 0, kNoExpiry)) std::abort();
     }
+  }
+
+  // Power-cycle drone i+1 with a new boot session (its tables start empty).
+  void reboot(std::size_t i, std::uint32_t session, const MeshConfig& cfg = MeshConfig{}) {
+    mgr[i] = std::make_unique<PackMeshManager>(static_cast<DroneId>(i + 1), cfg, session, clock, bus.nodes[i], gmcs[i],
+                                               guidance[i]);
+    if (!mgr[i]->installEpochKey(kPackEpoch, kPackKey, 0, kNoExpiry)) std::abort();
   }
 
   // Drone i+1 at (e, n); default full fuel, RF_DF + IR.
@@ -225,6 +259,12 @@ static SensorObservation fixObs(SensorType s, const GeoPoint& at, float cep, flo
   return o;
 }
 
+// An imager's fix reaches the pack once a second look confirms it
+// (MeshConfig::fix_confirm_count): report it as two agreeing looks.
+static bool reportFix(PackMeshManager& m, const SensorObservation& o) {
+  return m.reportLocalDetection(o) && m.reportLocalDetection(o);
+}
+
 // 5-drone line abreast, truth beacon east of the line (good crossing geometry).
 static const double kTruthE = 10000.0;
 static const double kTruthN = 2000.0;
@@ -265,11 +305,6 @@ TEST(static_vector_basics) {
   CHECK(v.empty());
 }
 
-TEST(crc32_known_vector) {
-  const char* s = "123456789";
-  CHECK(crc32(reinterpret_cast<const std::uint8_t*>(s), 9) == 0xCBF43926u);
-}
-
 TEST(geo_round_trip) {
   const GeoPoint a = enu(0, 0);
   const GeoPoint b = destinationPoint(a, 63.0, 12345.0);
@@ -279,131 +314,6 @@ TEST(geo_round_trip) {
   const LocalFrame f(kOrigin);
   const Vec2 v = f.toEnu(f.fromEnu(Vec2{1234.5, -987.6}, 0.0f));
   CHECK(std::fabs(v.e - 1234.5) < 1e-6 && std::fabs(v.n + 987.6) < 1e-6);
-}
-
-TEST(packet_round_trip_all_types) {
-  std::array<std::uint8_t, kMaxPacketBytes> buf{};
-  MeshPacket in;
-  in.header = PacketHeader{7, 42, 1'700'000'123'456ULL};
-
-  DroneState s;
-  s.id = 7;
-  s.mode = DroneMode::VERIFYING;
-  s.active_sensor = SensorType::IR;
-  s.installed_sensors = maskOf(SensorType::IR) | maskOf(SensorType::RF_DF);
-  s.available_links = kLinkMaskAll;
-  s.position = GeoPoint{36.1234567, -11.7654321, 3123.5f};
-  s.speed_mps = 41.5f;
-  s.heading_deg = 77.0f;
-  s.endurance_remaining_s = 20000.0f;
-  s.bingo_endurance_s = 1800.0f;
-  s.tasked_event = 0x00070001u;
-  s.timestamp_ms = 1'700'000'123'400ULL;
-  in.payload = HeartbeatPayload{s};
-  std::size_t n = encodePacket(in, buf.data(), buf.size());
-  CHECK(n > 0 && n <= kMaxPacketBytes);
-  MeshPacket out;
-  CHECK(decodePacket(buf.data(), n, out));
-  CHECK(out.type() == MsgType::HEARTBEAT);
-  CHECK(out.header.src == 7 && out.header.seq == 42 && out.header.time_ms == in.header.time_ms);
-  const auto* hb = std::get_if<HeartbeatPayload>(&out.payload);
-  CHECK(hb != nullptr);
-  if (hb != nullptr) {
-    CHECK(hb->state.mode == DroneMode::VERIFYING && hb->state.active_sensor == SensorType::IR);
-    CHECK(std::fabs(hb->state.position.lat_deg - 36.1234567) < 1e-7);
-    CHECK(std::fabs(hb->state.position.lon_deg + 11.7654321) < 1e-7);
-    CHECK(hb->state.endurance_remaining_s == 20000.0f && hb->state.tasked_event == 0x00070001u);
-    CHECK(hb->state.installed_sensors == s.installed_sensors && hb->state.available_links == kLinkMaskAll);
-  }
-
-  SensorObservation o = bearingObs(enu(0, 0), enu(5000, 5000), 0.0);
-  o.observer = 3;
-  o.event_hint = 0x00030001u;
-  o.observer_position = enu(0, 0);
-  o.timestamp_ms = 1'700'000'000'500ULL;
-  in.payload = ObservationPayload{o};
-  n = encodePacket(in, buf.data(), buf.size());
-  CHECK(n > 0 && decodePacket(buf.data(), n, out));
-  const auto* ob = std::get_if<ObservationPayload>(&out.payload);
-  CHECK(ob != nullptr);
-  if (ob != nullptr) {
-    CHECK(ob->obs.observer == 3 && ob->obs.sensor == SensorType::RF_DF && !ob->obs.has_fix);
-    CHECK(ob->obs.signature == 406025u && ob->obs.event_hint == 0x00030001u);
-    CHECK(std::fabs(ob->obs.bearing_deg - o.bearing_deg) < 1e-3f);
-  }
-
-  in.payload = TaskClaimPayload{0x00030001u, 5, 1, 0.77f};
-  n = encodePacket(in, buf.data(), buf.size());
-  CHECK(n > 0 && decodePacket(buf.data(), n, out));
-  const auto* tc = std::get_if<TaskClaimPayload>(&out.payload);
-  CHECK(tc != nullptr && tc->claimant == 5 && tc->role == 1 && tc->score == 0.77f);
-
-  in.payload = AlertIssuedPayload{0x00030001u, AlertLevel::PRIORITY, 4};
-  n = encodePacket(in, buf.data(), buf.size());
-  CHECK(n > 0 && decodePacket(buf.data(), n, out));
-  const auto* ai = std::get_if<AlertIssuedPayload>(&out.payload);
-  CHECK(ai != nullptr && ai->level == AlertLevel::PRIORITY && ai->issuer == 4);
-
-  in.payload = SignatureUpdatePayload{433920u};
-  n = encodePacket(in, buf.data(), buf.size());
-  CHECK(n > 0 && decodePacket(buf.data(), n, out));
-  const auto* su = std::get_if<SignatureUpdatePayload>(&out.payload);
-  CHECK(su != nullptr && su->signature == 433920u);
-
-  in.payload = LeavePayload{};
-  n = encodePacket(in, buf.data(), buf.size());
-  CHECK(n == kHeaderBytes + kCrcBytes && decodePacket(buf.data(), n, out));
-  CHECK(out.type() == MsgType::LEAVE);
-}
-
-TEST(packet_rejects_corruption) {
-  std::array<std::uint8_t, kMaxPacketBytes> buf{};
-  MeshPacket in;
-  in.header = PacketHeader{2, 1, 1000};
-  DroneState s;
-  s.id = 2;
-  s.installed_sensors = 1;
-  in.payload = HeartbeatPayload{s};
-  const std::size_t n = encodePacket(in, buf.data(), buf.size());
-  CHECK(n > 0);
-  MeshPacket out;
-  CHECK(decodePacket(buf.data(), n, out));
-
-  // Any single flipped byte must be rejected (CRC, magic, length or range checks).
-  int accepted = 0;
-  for (std::size_t i = 0; i < n; ++i) {
-    std::array<std::uint8_t, kMaxPacketBytes> bad = buf;
-    bad[i] = static_cast<std::uint8_t>(bad[i] ^ 0x5A);
-    if (decodePacket(bad.data(), n, out)) ++accepted;
-  }
-  CHECK(accepted == 0);
-
-  // Truncation and oversize.
-  for (std::size_t len = 0; len < n; ++len) CHECK(!decodePacket(buf.data(), len, out));
-  CHECK(!decodePacket(buf.data(), kMaxPacketBytes + 1, out));
-  CHECK(!decodePacket(nullptr, 10, out));
-
-  // A well-formed frame carrying NaN or an out-of-range latitude is refused.
-  s.speed_mps = std::nanf("");
-  in.payload = HeartbeatPayload{s};
-  const std::size_t n2 = encodePacket(in, buf.data(), buf.size());
-  CHECK(n2 > 0 && !decodePacket(buf.data(), n2, out));
-  s.speed_mps = 1.0f;
-  s.position.lat_deg = 91.0;
-  in.payload = HeartbeatPayload{s};
-  const std::size_t n3 = encodePacket(in, buf.data(), buf.size());
-  CHECK(n3 > 0 && !decodePacket(buf.data(), n3, out));
-
-  // Heartbeat whose body id disagrees with the header src is spoofed/corrupt.
-  s.position.lat_deg = 36.0;
-  s.id = 9;
-  in.payload = HeartbeatPayload{s};
-  const std::size_t n4 = encodePacket(in, buf.data(), buf.size());
-  CHECK(n4 > 0 && !decodePacket(buf.data(), n4, out));
-
-  // Output buffer too small.
-  std::array<std::uint8_t, 10> tiny{};
-  CHECK(encodePacket(in, tiny.data(), tiny.size()) == 0);
 }
 
 TEST(triangulation_exact_and_weighted) {
@@ -747,14 +657,17 @@ TEST(advisory_then_priority_exactly_once) {
   p->run(2000);
   reportBeacon(*p, {1, 2, 3, 4});
   p->run(5000);
+  // A position from bearings alone must hold before anyone is warned (multipath guard).
+  CHECK(p->totalAlerts(AlertLevel::ADVISORY) == 0);
+  p->run(MeshConfig{}.advisory_bearing_hold_ms);
   // RF-only picture: early-warning ADVISORY, once, across the whole pack.
   CHECK(p->totalAlerts(AlertLevel::ADVISORY) == 1);
   CHECK(p->totalAlerts(AlertLevel::PRIORITY) == 0);
 
   // Two verifiers close in and add geolocated imaging fixes.
   const GeoPoint truth = enu(kTruthE + 80.0, kTruthN - 50.0);
-  CHECK(p->mgr[1]->reportLocalDetection(fixObs(SensorType::IR, truth, 60.0f, 0.8f)));
-  CHECK(p->mgr[3]->reportLocalDetection(fixObs(SensorType::IR, enu(kTruthE - 40.0, kTruthN + 30.0), 60.0f, 0.8f)));
+  CHECK(reportFix(*p->mgr[1], fixObs(SensorType::IR, truth, 60.0f, 0.8f)));
+  CHECK(reportFix(*p->mgr[3], fixObs(SensorType::IR, enu(kTruthE - 40.0, kTruthN + 30.0), 60.0f, 0.8f)));
   p->run(8000);
 
   CHECK(p->totalAlerts(AlertLevel::PRIORITY) == 1);
@@ -797,7 +710,7 @@ TEST(alert_owner_failover) {
   // The would-be owner cannot reach the GMCS: the next drone in line takes over.
   reportBeacon(*p, {1, 2, 3, 4});
   for (auto& g : p->gmcs) g.fail = true;
-  p->run(3000);
+  p->run(3000 + MeshConfig{}.advisory_bearing_hold_ms);
   CHECK(p->totalAlerts(AlertLevel::ADVISORY) == 0);
   std::uint32_t failures = 0;
   for (std::size_t i = 0; i < 5; ++i) failures += p->mgr[i]->stats().alert_send_failures;
@@ -1007,6 +920,533 @@ TEST(observation_slot_replacement_and_expiry) {
   CHECK(t.events().empty());
 }
 
+// ------------------------------------------------------- crypto and frames
+
+static std::size_t fromHex(const char* hex, std::uint8_t* out, std::size_t cap) {
+  std::size_t n = 0;
+  for (std::size_t i = 0; hex[i] != '\0' && hex[i + 1] != '\0' && n < cap; i += 2) {
+    const auto nib = [](char c) -> unsigned {
+      return c <= '9' ? static_cast<unsigned>(c - '0') : static_cast<unsigned>(c - 'a' + 10);
+    };
+    out[n++] = static_cast<std::uint8_t>((nib(hex[i]) << 4U) | nib(hex[i + 1]));
+  }
+  return n;
+}
+
+static bool equalsHex(const std::uint8_t* data, std::size_t n, const char* hex) {
+  std::array<std::uint8_t, 512> want{};
+  return fromHex(hex, want.data(), want.size()) == n && std::memcmp(data, want.data(), n) == 0;
+}
+
+static const char kSunscreen[] =
+    "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
+
+TEST(crypto_rfc8439_vectors) {
+  using namespace crypto;
+  // 2.3.2: block function.
+  Key k{};
+  for (std::size_t i = 0; i < k.size(); ++i) k[i] = static_cast<std::uint8_t>(i);
+  Nonce n{};
+  fromHex("000000090000004a00000000", n.data(), n.size());
+  std::array<std::uint8_t, 64> block{};
+  chacha20Block(k, 1, n, block.data());
+  CHECK(equalsHex(block.data(), 64,
+                  "10f1e7e4d13b5915500fdd1fa32071c4c7d1f4c733c068030422aa9ac3d46c4e"
+                  "d2826446079faa0914c2d705d98b02a2b5129cd1de164eb9cbd083e8a2503c4e"));
+
+  // 2.4.2: encryption.
+  const std::size_t len = sizeof kSunscreen - 1;
+  const auto* pt = reinterpret_cast<const std::uint8_t*>(kSunscreen);
+  std::array<std::uint8_t, 128> ct{};
+  fromHex("000000000000004a00000000", n.data(), n.size());
+  chacha20Xor(k, 1, n, pt, ct.data(), len);
+  CHECK(equalsHex(ct.data(), len,
+                  "6e2e359a2568f98041ba0728dd0d6981e97e7aec1d4360c20a27afccfd9fae0bf91b65c5524733ab8f593dabcd62b3571639"
+                  "d624e65152ab8f530c359f0861d807ca0dbf500d6a6156a38e088a22b65e52bc514d16ccf806818ce91ab77937365af90bbf"
+                  "74a35be6b40b8eedf2785e42874d"));
+
+  // 2.5.2: Poly1305, one-shot and fed in odd-sized pieces.
+  std::array<std::uint8_t, 32> pk{};
+  fromHex("85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b", pk.data(), pk.size());
+  const char* msg = "Cryptographic Forum Research Group";
+  const auto* m = reinterpret_cast<const std::uint8_t*>(msg);
+  Tag t1{};
+  {
+    Poly1305 mac(pk.data());
+    mac.update(m, 34);
+    mac.finish(t1);
+  }
+  CHECK(equalsHex(t1.data(), 16, "a8061dc1305136c6c22b8baf0c0127a9"));
+  Tag t2{};
+  {
+    Poly1305 mac(pk.data());
+    mac.update(m, 3);
+    mac.update(m + 3, 0);
+    mac.update(m + 3, 17);
+    mac.update(m + 20, 14);
+    mac.finish(t2);
+  }
+  CHECK(t1 == t2);
+
+  // Appendix A.3 #5-#11: inputs chosen to hit the carries and the final reduction mod 2^130 - 5.
+  struct PolyEdge {
+    const char* key;
+    const char* msg;
+    const char* tag;
+  };
+  static const PolyEdge kEdges[] = {
+      {"0200000000000000000000000000000000000000000000000000000000000000", "ffffffffffffffffffffffffffffffff",
+       "03000000000000000000000000000000"},
+      {"02000000000000000000000000000000ffffffffffffffffffffffffffffffff", "02000000000000000000000000000000",
+       "03000000000000000000000000000000"},
+      {"0100000000000000000000000000000000000000000000000000000000000000",
+       "fffffffffffffffffffffffffffffffff0ffffffffffffffffffffffffffffff11000000000000000000000000000000",
+       "05000000000000000000000000000000"},
+      {"0100000000000000000000000000000000000000000000000000000000000000",
+       "fffffffffffffffffffffffffffffffffbfefefefefefefefefefefefefefefe01010101010101010101010101010101",
+       "00000000000000000000000000000000"},
+      {"0200000000000000000000000000000000000000000000000000000000000000", "fdffffffffffffffffffffffffffffff",
+       "faffffffffffffffffffffffffffffff"},
+      {"0100000000000000040000000000000000000000000000000000000000000000",
+       "e33594d7505e43b900000000000000003394d7505e4379cd0100000000000000000000000000000000000000000000000100000000"
+       "0000000000000000000000",
+       "14000000000000005500000000000000"},
+      {"0100000000000000040000000000000000000000000000000000000000000000",
+       "e33594d7505e43b900000000000000003394d7505e4379cd010000000000000000000000000000000000000000000000",
+       "13000000000000000000000000000000"},
+  };
+  for (const PolyEdge& e : kEdges) {
+    std::array<std::uint8_t, 32> ek{};
+    std::array<std::uint8_t, 64> em{};
+    fromHex(e.key, ek.data(), ek.size());
+    const std::size_t ml = fromHex(e.msg, em.data(), em.size());
+    Tag et{};
+    Poly1305 mac(ek.data());
+    mac.update(em.data(), ml);
+    mac.finish(et);
+    CHECK(equalsHex(et.data(), 16, e.tag));
+  }
+
+  // 2.8.2: AEAD.
+  Key ak{};
+  for (std::size_t i = 0; i < ak.size(); ++i) ak[i] = static_cast<std::uint8_t>(0x80 + i);
+  fromHex("070000004041424344454647", n.data(), n.size());
+  std::array<std::uint8_t, 12> aad{};
+  fromHex("50515253c0c1c2c3c4c5c6c7", aad.data(), aad.size());
+  Tag tag{};
+  aeadSeal(ak, n, aad.data(), aad.size(), pt, len, ct.data(), tag);
+  CHECK(equalsHex(ct.data(), len,
+                  "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d63dbea45e8ca9671282fafb69da92728b1a71"
+                  "de0a9e060b2905d6a5b67ecd3b3692ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc3ff4def0"
+                  "8e4b7a9de576d26586cec64b6116"));
+  CHECK(equalsHex(tag.data(), 16, "1ae10b594f09e26a7e902ecbd0600691"));
+  std::array<std::uint8_t, 128> back{};
+  CHECK(aeadOpen(ak, n, aad.data(), aad.size(), ct.data(), len, tag, back.data()));
+  CHECK(std::memcmp(back.data(), pt, len) == 0);
+
+  // Any changed bit in the ciphertext, the AAD or the tag is refused, and no plaintext leaks.
+  int forged = 0;
+  int leaked = 0;
+  for (std::size_t i = 0; i < len + aad.size() + tag.size(); ++i) {
+    std::array<std::uint8_t, 128> c2 = ct;
+    std::array<std::uint8_t, 12> a2 = aad;
+    Tag t3 = tag;
+    if (i < len) {
+      c2[i] ^= 0x01;
+    } else if (i < len + aad.size()) {
+      a2[i - len] ^= 0x80;
+    } else {
+      t3[i - len - aad.size()] ^= 0x10;
+    }
+    back.fill(0xEE);
+    if (aeadOpen(ak, n, a2.data(), a2.size(), c2.data(), len, t3, back.data())) ++forged;
+    for (std::size_t j = 0; j < len; ++j) leaked += back[j] != 0 ? 1 : 0;
+  }
+  CHECK(forged == 0);
+  CHECK(leaked == 0);
+
+  const std::uint8_t a[3] = {1, 2, 3};
+  const std::uint8_t b[3] = {1, 2, 4};
+  CHECK(constantTimeEqual(a, a, 3) && !constantTimeEqual(a, b, 3) && constantTimeEqual(a, b, 2));
+}
+
+#include "aead_vectors.inc"
+
+TEST(crypto_matches_an_independent_implementation) {
+  // Edge lengths around the 16- and 64-byte boundaries, cross-checked against OpenSSL.
+  int checked = 0;
+  for (const AeadVector& v : kAeadVectors) {
+    crypto::Key k{};
+    crypto::Nonce n{};
+    std::array<std::uint8_t, 64> aad{};
+    std::array<std::uint8_t, 160> pt{};
+    std::array<std::uint8_t, 192> want{};
+    fromHex(v.key, k.data(), k.size());
+    fromHex(v.nonce, n.data(), n.size());
+    const std::size_t aad_len = fromHex(v.aad, aad.data(), aad.size());
+    const std::size_t len = fromHex(v.pt, pt.data(), pt.size());
+    const std::size_t want_len = fromHex(v.ct_tag, want.data(), want.size());
+    CHECK(want_len == len + crypto::kTagBytes);
+    std::array<std::uint8_t, 160> ct{};
+    crypto::Tag tag{};
+    crypto::aeadSeal(k, n, aad.data(), aad_len, pt.data(), len, ct.data(), tag);
+    CHECK(std::memcmp(ct.data(), want.data(), len) == 0);
+    CHECK(std::memcmp(tag.data(), want.data() + len, crypto::kTagBytes) == 0);
+    std::array<std::uint8_t, 160> back{};
+    CHECK(crypto::aeadOpen(k, n, aad.data(), aad_len, ct.data(), len, tag, back.data()));
+    CHECK(std::memcmp(back.data(), pt.data(), len) == 0);
+    ++checked;
+  }
+  CHECK(checked == 11);
+}
+
+// Two drones' security layers sharing the pack key.
+struct SecPair {
+  MeshConfig cfg{};
+  MeshSecurity tx{7, 1, cfg};
+  MeshSecurity rx{3, 1, cfg};
+  TimeMs now = 1'700'000'000'000ULL;
+  SecPair() {
+    if (!tx.installEpochKey(kPackEpoch, kPackKey, 0, kNoExpiry) || !rx.installEpochKey(kPackEpoch, kPackKey, 0, kNoExpiry)) {
+      std::abort();
+    }
+  }
+  template <typename Payload>
+  std::size_t seal(const Payload& payload, std::array<std::uint8_t, kMaxPacketBytes>& buf, MeshSecurity* from = nullptr) {
+    MeshPacket p;
+    p.payload = payload;
+    return (from != nullptr ? *from : tx).seal(p, now, buf.data(), buf.size());
+  }
+};
+
+static DroneState sampleState(DroneId id) {
+  DroneState s;
+  s.id = id;
+  s.mode = DroneMode::VERIFYING;
+  s.active_sensor = SensorType::IR;
+  s.installed_sensors = maskOf(SensorType::IR) | maskOf(SensorType::RF_DF);
+  s.available_links = kLinkMaskAll;
+  s.position = GeoPoint{36.1234567, -11.7654321, 3123.5f};
+  s.speed_mps = 41.5f;
+  s.heading_deg = 77.0f;
+  s.endurance_remaining_s = 20000.0f;
+  s.bingo_endurance_s = 1800.0f;
+  s.tasked_event = 0x00070001u;
+  s.timestamp_ms = 1'700'000'123'400ULL;
+  return s;
+}
+
+TEST(frame_round_trip_all_types) {
+  auto sp = std::make_unique<SecPair>();
+  std::array<std::uint8_t, kMaxPacketBytes> buf{};
+  MeshPacket out;
+
+  const DroneState s = sampleState(7);
+  std::size_t n = sp->seal(HeartbeatPayload{s}, buf);
+  CHECK(n == kFrameHeaderBytes + kBodyHeaderBytes + 46 + kFrameTagBytes);
+  CHECK(sp->rx.open(buf.data(), n, sp->now, out) == OpenStatus::OK);
+  CHECK(out.type() == MsgType::HEARTBEAT);
+  CHECK(out.header.src == 7 && out.header.seq == 1 && out.header.session == 1 && out.header.epoch == kPackEpoch);
+  CHECK(out.header.time_ms == sp->now);
+  const auto* hb = std::get_if<HeartbeatPayload>(&out.payload);
+  CHECK(hb != nullptr);
+  if (hb != nullptr) {
+    CHECK(hb->state.mode == DroneMode::VERIFYING && hb->state.active_sensor == SensorType::IR);
+    CHECK(std::fabs(hb->state.position.lat_deg - 36.1234567) < 1e-7);
+    CHECK(std::fabs(hb->state.position.lon_deg + 11.7654321) < 1e-7);
+    CHECK(hb->state.endurance_remaining_s == 20000.0f && hb->state.tasked_event == 0x00070001u);
+    CHECK(hb->state.installed_sensors == s.installed_sensors && hb->state.available_links == kLinkMaskAll);
+  }
+  // The payload is not readable on the wire.
+  bool clear = false;
+  for (std::size_t i = kFrameHeaderBytes; i + 4 <= n; ++i) {
+    std::uint32_t v;
+    std::memcpy(&v, buf.data() + i, 4);
+    if (v == 0x00070001u) clear = true;
+  }
+  CHECK(!clear);
+
+  SensorObservation o = bearingObs(enu(0, 0), enu(5000, 5000), 0.0);
+  o.observer = 7;
+  o.event_hint = 0x00070001u;
+  o.observer_position = enu(0, 0);
+  o.timestamp_ms = 1'700'000'000'500ULL;
+  n = sp->seal(ObservationPayload{o}, buf);
+  CHECK(n == 104);  // the largest frame
+  CHECK(sp->rx.open(buf.data(), n, sp->now, out) == OpenStatus::OK);
+  const auto* ob = std::get_if<ObservationPayload>(&out.payload);
+  CHECK(ob != nullptr);
+  if (ob != nullptr) {
+    CHECK(ob->obs.observer == 7 && ob->obs.sensor == SensorType::RF_DF && !ob->obs.has_fix);
+    CHECK(ob->obs.signature == 406025u && ob->obs.event_hint == 0x00070001u);
+    CHECK(std::fabs(ob->obs.bearing_deg - o.bearing_deg) < 1e-3f);
+  }
+
+  n = sp->seal(TaskClaimPayload{0x00030001u, 7, 1, 0.77f}, buf);
+  CHECK(n > 0 && sp->rx.open(buf.data(), n, sp->now, out) == OpenStatus::OK);
+  const auto* tc = std::get_if<TaskClaimPayload>(&out.payload);
+  CHECK(tc != nullptr && tc->claimant == 7 && tc->role == 1 && tc->score == 0.77f);
+
+  n = sp->seal(AlertIssuedPayload{0x00030001u, AlertLevel::PRIORITY, 7}, buf);
+  CHECK(n > 0 && sp->rx.open(buf.data(), n, sp->now, out) == OpenStatus::OK);
+  const auto* ai = std::get_if<AlertIssuedPayload>(&out.payload);
+  CHECK(ai != nullptr && ai->level == AlertLevel::PRIORITY && ai->issuer == 7);
+
+  n = sp->seal(SignatureUpdatePayload{433920u}, buf);
+  CHECK(n > 0 && sp->rx.open(buf.data(), n, sp->now, out) == OpenStatus::OK);
+  const auto* su = std::get_if<SignatureUpdatePayload>(&out.payload);
+  CHECK(su != nullptr && su->signature == 433920u);
+
+  n = sp->seal(LeavePayload{}, buf);
+  CHECK(n == kFrameHeaderBytes + kBodyHeaderBytes + kFrameTagBytes);
+  CHECK(sp->rx.open(buf.data(), n, sp->now, out) == OpenStatus::OK && out.type() == MsgType::LEAVE);
+  CHECK(sp->tx.lastSeq() == 6);
+
+  // Our own frames come back on multicast loopback and are skipped, not counted as errors.
+  CHECK(sp->tx.open(buf.data(), n, sp->now, out) == OpenStatus::LOOPBACK);
+
+  // Output buffer too small: nothing sealed, no sequence number spent.
+  std::array<std::uint8_t, 40> tiny{};
+  MeshPacket p;
+  p.payload = HeartbeatPayload{s};
+  CHECK(sp->tx.seal(p, sp->now, tiny.data(), tiny.size()) == 0);
+  CHECK(sp->tx.lastSeq() == 6);
+}
+
+TEST(frame_rejects_corruption_and_bad_content) {
+  auto sp = std::make_unique<SecPair>();
+  std::array<std::uint8_t, kMaxPacketBytes> buf{};
+  MeshPacket out;
+  const std::size_t n = sp->seal(HeartbeatPayload{sampleState(7)}, buf);
+  CHECK(n > 0);
+
+  // Any single flipped byte, header or ciphertext or tag, is refused.
+  int accepted = 0;
+  for (std::size_t i = 0; i < n; ++i) {
+    std::array<std::uint8_t, kMaxPacketBytes> bad = buf;
+    bad[i] = static_cast<std::uint8_t>(bad[i] ^ 0x5A);
+    if (sp->rx.open(bad.data(), n, sp->now, out) == OpenStatus::OK) ++accepted;
+  }
+  CHECK(accepted == 0);
+  // Truncation, oversize, null.
+  for (std::size_t len = 0; len < n; ++len) CHECK(sp->rx.open(buf.data(), len, sp->now, out) == OpenStatus::MALFORMED);
+  CHECK(sp->rx.open(buf.data(), kMaxPacketBytes + 1, sp->now, out) == OpenStatus::MALFORMED);
+  CHECK(sp->rx.open(nullptr, 60, sp->now, out) == OpenStatus::MALFORMED);
+  // The untouched frame still opens after all that.
+  CHECK(sp->rx.open(buf.data(), n, sp->now, out) == OpenStatus::OK);
+
+  // A key holder can seal anything, so authentic frames are still validated:
+  // NaN, an out-of-range latitude, a heartbeat for another drone, an absurd claim score.
+  DroneState s = sampleState(7);
+  s.speed_mps = std::nanf("");
+  std::size_t k = sp->seal(HeartbeatPayload{s}, buf);
+  CHECK(k > 0 && sp->rx.open(buf.data(), k, sp->now, out) == OpenStatus::MALFORMED);
+  s = sampleState(7);
+  s.position.lat_deg = 91.0;
+  k = sp->seal(HeartbeatPayload{s}, buf);
+  CHECK(k > 0 && sp->rx.open(buf.data(), k, sp->now, out) == OpenStatus::MALFORMED);
+  k = sp->seal(HeartbeatPayload{sampleState(9)}, buf);
+  CHECK(k > 0 && sp->rx.open(buf.data(), k, sp->now, out) == OpenStatus::MALFORMED);
+  k = sp->seal(TaskClaimPayload{0x00070001u, 7, 0, 1.0e38f}, buf);
+  CHECK(k > 0 && sp->rx.open(buf.data(), k, sp->now, out) == OpenStatus::MALFORMED);
+}
+
+TEST(per_drone_keys_bind_the_sender) {
+  auto sp = std::make_unique<SecPair>();
+  std::array<std::uint8_t, kMaxPacketBytes> buf{};
+  MeshPacket out;
+  crypto::Key k7{};
+  crypto::Key k8{};
+  deriveDroneKey(kPackKey, kPackEpoch, 7, k7);
+  deriveDroneKey(kPackKey, kPackEpoch, 8, k8);
+  CHECK(k7 != k8 && k7 != kPackKey);
+
+  // Relabelling a frame as coming from another drone breaks it: the sender id
+  // picks the key and is authenticated as part of the header.
+  const std::size_t n = sp->seal(SignatureUpdatePayload{433920u}, buf);
+  std::array<std::uint8_t, kMaxPacketBytes> relabelled = buf;
+  relabelled[4] = 8;
+  CHECK(sp->rx.open(relabelled.data(), n, sp->now, out) == OpenStatus::AUTH_FAILED);
+
+  // An outsider with a different key for the same epoch number cannot speak.
+  MeshSecurity outsider(9, 1, sp->cfg);
+  CHECK(outsider.installEpochKey(kPackEpoch, testKey(77), 0, kNoExpiry));
+  const std::size_t m = sp->seal(SignatureUpdatePayload{433920u}, buf, &outsider);
+  CHECK(m > 0 && sp->rx.open(buf.data(), m, sp->now, out) == OpenStatus::AUTH_FAILED);
+  // A frame under an epoch the receiver does not hold.
+  MeshSecurity other_epoch(9, 1, sp->cfg);
+  CHECK(other_epoch.installEpochKey(42, kPackKey, 0, kNoExpiry));
+  const std::size_t e = sp->seal(SignatureUpdatePayload{433920u}, buf, &other_epoch);
+  CHECK(e > 0 && sp->rx.open(buf.data(), e, sp->now, out) == OpenStatus::NO_KEY);
+}
+
+TEST(replay_window_and_boot_sessions) {
+  auto sp = std::make_unique<SecPair>();
+  std::array<std::array<std::uint8_t, kMaxPacketBytes>, 72> f{};
+  std::array<std::size_t, 72> len{};
+  for (std::size_t i = 1; i < f.size(); ++i) len[i] = sp->seal(LeavePayload{}, f[i]);  // seq = i
+  MeshPacket out;
+  const auto open = [&](std::size_t i) { return sp->rx.open(f[i].data(), len[i], sp->now, out); };
+
+  CHECK(open(1) == OpenStatus::OK);
+  CHECK(open(1) == OpenStatus::REPLAYED);
+  CHECK(open(3) == OpenStatus::OK);
+  CHECK(open(2) == OpenStatus::OK);  // reordered within the window
+  CHECK(open(2) == OpenStatus::REPLAYED);
+  CHECK(open(70) == OpenStatus::OK);
+  CHECK(open(6) == OpenStatus::REPLAYED);  // 64 behind the newest: outside the window
+  CHECK(open(7) == OpenStatus::OK);        // 63 behind: still inside
+  CHECK(open(7) == OpenStatus::REPLAYED);
+
+  // The sender reboots with a higher session: accepted, and its old session is closed.
+  MeshSecurity rebooted(7, 2, sp->cfg);
+  CHECK(rebooted.installEpochKey(kPackEpoch, kPackKey, 0, kNoExpiry));
+  std::array<std::uint8_t, kMaxPacketBytes> r{};
+  const std::size_t rn = sp->seal(LeavePayload{}, r, &rebooted);
+  CHECK(sp->rx.open(r.data(), rn, sp->now, out) == OpenStatus::OK && out.header.session == 2 && out.header.seq == 1);
+  CHECK(open(71) == OpenStatus::REPLAYED);  // never seen, but from the older session
+
+  // Why the session must grow: a reboot that reuses session 2 reuses nonces,
+  // and its early frames are taken for replays.
+  MeshSecurity reused(7, 2, sp->cfg);
+  CHECK(reused.installEpochKey(kPackEpoch, kPackKey, 0, kNoExpiry));
+  const std::size_t un = sp->seal(LeavePayload{}, r, &reused);
+  CHECK(un > 0 && sp->rx.open(r.data(), un, sp->now, out) == OpenStatus::REPLAYED);
+}
+
+TEST(stale_and_future_frames_are_refused) {
+  auto sp = std::make_unique<SecPair>();
+  std::array<std::uint8_t, kMaxPacketBytes> buf{};
+  MeshPacket out;
+  const std::size_t n = sp->seal(LeavePayload{}, buf);
+  const TimeMs sent = sp->now;
+  CHECK(sp->rx.open(buf.data(), n, sent + sp->cfg.frame_max_age_ms + 1, out) == OpenStatus::STALE);
+  CHECK(sp->rx.open(buf.data(), n, sent - sp->cfg.max_clock_skew_ms - 1, out) == OpenStatus::STALE);
+  // A refused frame does not use up its place in the replay window.
+  CHECK(sp->rx.open(buf.data(), n, sent + 40, out) == OpenStatus::OK);
+}
+
+TEST(key_epoch_rollover_and_erase) {
+  MeshConfig cfg;
+  const TimeMs t = 1'700'000'000'000ULL;
+  const TimeMs rekey = t + 60'000;
+  MeshSecurity a(7, 1, cfg);
+  MeshSecurity b(3, 1, cfg);
+  for (MeshSecurity* s : {&a, &b}) {
+    CHECK(s->installEpochKey(1, kPackKey, 0, rekey + 30'000));  // old epoch overlaps the new by 30 s
+    CHECK(s->installEpochKey(2, testKey(2), rekey, kNoExpiry));
+  }
+  CHECK(!a.installEpochKey(3, testKey(3), t, t));  // empty window
+  std::uint16_t e = 0;
+  CHECK(a.sendEpoch(t, e) && e == 1);
+  CHECK(a.sendEpoch(rekey, e) && e == 2);
+
+  std::array<std::uint8_t, kMaxPacketBytes> old_frame{};
+  MeshPacket p;
+  p.payload = LeavePayload{};
+  const std::size_t on = a.seal(p, t, old_frame.data(), old_frame.size());
+  CHECK(on > 0 && p.header.epoch == 1);
+  MeshPacket out;
+  CHECK(b.open(old_frame.data(), on, t + 100, out) == OpenStatus::OK);
+
+  std::array<std::uint8_t, kMaxPacketBytes> new_frame{};
+  MeshPacket q;
+  q.payload = LeavePayload{};
+  const std::size_t nn = a.seal(q, rekey + 10, new_frame.data(), new_frame.size());
+  CHECK(nn > 0 && q.header.epoch == 2);
+  CHECK(b.open(new_frame.data(), nn, rekey + 20, out) == OpenStatus::OK);
+
+  // A frame under epoch 1, after epoch 1 and its grace have ended.
+  MeshSecurity late(7, 5, cfg);
+  CHECK(late.installEpochKey(1, kPackKey, 0, kNoExpiry));
+  const TimeMs after = rekey + 30'000 + cfg.key_epoch_grace_ms + 1;
+  std::array<std::uint8_t, kMaxPacketBytes> late_frame{};
+  MeshPacket r;
+  r.payload = LeavePayload{};
+  const std::size_t ln = late.seal(r, after, late_frame.data(), late_frame.size());
+  CHECK(ln > 0 && b.open(late_frame.data(), ln, after, out) == OpenStatus::NO_KEY);
+
+  // Erasing keys silences the sender; zeroizing empties every slot.
+  CHECK(a.eraseEpochKey(2) && !a.eraseEpochKey(2));
+  CHECK(!a.sendEpoch(rekey + 40'000, e));
+  CHECK(a.seal(q, rekey + 40'000, new_frame.data(), new_frame.size()) == 0);
+  b.zeroizeAll();
+  CHECK(b.epochCount() == 0);
+  CHECK(b.open(new_frame.data(), nn, rekey + 20, out) == OpenStatus::NO_KEY);
+}
+
+TEST(mesh_ignores_outsiders_replays_and_revoked_drones) {
+  auto p = std::make_unique<Pack>(4);
+  for (std::size_t i = 0; i < 3; ++i) p->place(i, 0, static_cast<double>(i) * 5000.0);
+  // Node 3 is an outsider: right frame format, wrong key.
+  p->mgr[3] = std::make_unique<PackMeshManager>(9, MeshConfig{}, 1U, p->clock, p->bus.nodes[3], p->gmcs[3], p->guidance[3]);
+  CHECK(p->mgr[3]->installEpochKey(kPackEpoch, testKey(66), 0, kNoExpiry));
+  p->place(3, 0, 15000);
+  p->bus.record_src = 1;  // record drone 2's traffic for a replay later
+  p->run(3000);
+  for (std::size_t i = 0; i < 3; ++i) {
+    CHECK(p->mgr[i]->table().peerCount() == 2);  // the outsider is never discovered
+    CHECK(p->mgr[i]->table().findPeer(9) == nullptr);
+    CHECK(p->mgr[i]->stats().rx_auth_failed > 0);
+  }
+  // The outsider's dismissal and alert notice change nothing.
+  p->mgr[3]->applyGmcsDismissal(433920u);
+  p->run(500);
+  for (std::size_t i = 0; i < 3; ++i) CHECK(!p->mgr[i]->table().isBenign(433920u));
+
+  // Replaying drone 2's recorded frames: refused at once as replays, later as stale.
+  p->bus.record_src = -1;
+  const std::size_t taped = p->bus.tape_n;
+  CHECK(taped >= 3);
+  const std::uint32_t replayed_before = p->mgr[0]->stats().rx_replayed;
+  for (std::size_t k = 0; k < taped; ++k) (void)p->bus.broadcastFrom(3, p->bus.tape[k].data.data(), p->bus.tape[k].len);
+  p->run(100);
+  CHECK(p->mgr[0]->stats().rx_replayed >= replayed_before + static_cast<std::uint32_t>(taped));
+  p->clock.now += 10'000;
+  const std::uint32_t stale_before = p->mgr[0]->stats().rx_stale;
+  for (std::size_t k = 0; k < taped; ++k) (void)p->bus.broadcastFrom(3, p->bus.tape[k].data.data(), p->bus.tape[k].len);
+  p->mgr[0]->tick();
+  CHECK(p->mgr[0]->stats().rx_stale >= stale_before + static_cast<std::uint32_t>(taped));
+
+  // Drone 3 reports a fix, then the GMCS revokes it: its readings are forgotten
+  // and its frames refused.
+  p->run(2000);
+  CHECK(reportFix(*p->mgr[2], fixObs(SensorType::IR, enu(9000, 0), 50.0f)));
+  p->run(1000);
+  CHECK(p->mgr[0]->table().events().size() == 1);
+  CHECK(p->mgr[0]->revokeDrone(3) && p->mgr[1]->revokeDrone(3));
+  CHECK(!p->mgr[0]->revokeDrone(1));  // not itself
+  p->run(2000);
+  for (std::size_t i = 0; i < 2; ++i) {
+    CHECK(p->mgr[i]->table().events().empty());
+    CHECK(p->mgr[i]->table().findPeer(3) == nullptr);
+    CHECK(p->mgr[i]->stats().rx_revoked > 0);
+  }
+}
+
+TEST(no_key_means_silence_and_reboot_is_accepted) {
+  auto p = std::make_unique<Pack>(2);
+  p->place(0, 0, 0);
+  p->place(1, 0, 5000);
+  p->run(2000);
+  CHECK(p->mgr[0]->table().peerCount() == 1);
+  // Drone 2 reboots with a new session and comes straight back.
+  p->reboot(1, 2);
+  p->place(1, 0, 5000);
+  p->run(2000);
+  CHECK(p->mgr[0]->table().peerCount() == 1);
+  CHECK(p->mgr[0]->stats().rx_replayed == 0);
+  const PeerRecord* r = p->mgr[0]->table().findPeer(2);
+  CHECK(r != nullptr && r->last_session == 2);
+  // Keys zeroized: nothing goes out, and the peer times the drone out.
+  p->mgr[1]->zeroizeKeys();
+  const std::uint32_t tx = p->mgr[1]->stats().tx_packets;
+  p->run(7000);
+  CHECK(p->mgr[1]->stats().tx_packets == tx);
+  CHECK(p->mgr[1]->stats().tx_no_key > 0);
+  CHECK(p->mgr[0]->table().peerCount() == 0);
+}
+
 // ------------------------------------------- regressions from code review
 
 static SensorObservation tableObs(SensorObservation o, DroneId observer, TimeMs ts, EventId hint = kNoEvent) {
@@ -1039,6 +1479,33 @@ TEST(same_frequency_sources_far_apart_stay_separate) {
   brg.observer_position = enu(0, -30000);
   const EventId ic = t.ingestObservation(tableObs(brg, 4, now), now);
   CHECK(ic != kNoEvent && ic != ia);
+}
+
+TEST(readings_beyond_pack_scale_never_fuse) {
+  // Found by the fuzzer: two bearings on one frequency from observers 16,000 km
+  // apart joined one event, and the flat-frame fusion put it off the earth.
+  MeshConfig cfg;
+  SituationalAwarenessTable t(1, cfg);
+  const TimeMs now = 1'700'000'000'000ULL;
+  SensorObservation far_brg = bearingObs(GeoPoint{35.92, 162.48, 3000.0f}, GeoPoint{36.2, 162.48, 0.0f});
+  far_brg.observer_position = GeoPoint{35.92, 162.48, 3000.0f};
+  SensorObservation near_brg = bearingObs(enu(0, 0), enu(10000, 9000));
+  near_brg.observer_position = enu(0, 0);
+  const EventId a = t.ingestObservation(tableObs(far_brg, 2, now), now);
+  const EventId b = t.ingestObservation(tableObs(near_brg, 4, now), now);
+  CHECK(a != kNoEvent && b != kNoEvent && a != b);
+  t.refresh(now);
+  CHECK(t.events().size() == 2);  // not merged either
+  for (const auto& ev : t.events()) CHECK(isPlausible(ev.position));
+
+  // fuseEvent on its own never reports a fused position off the earth.
+  DetectedEvent ev;
+  ev.id = 1;
+  CHECK(ev.observations.push_back(tableObs(far_brg, 2, now)));
+  CHECK(ev.observations.push_back(tableObs(near_brg, 4, now)));
+  fuseEvent(ev, cfg);
+  CHECK(isPlausible(ev.position));
+  CHECK(!ev.localized);
 }
 
 TEST(rebooted_drone_never_reuses_an_event_id_in_use) {
@@ -1127,7 +1594,7 @@ TEST(anti_entropy_eventually_resends_every_reading) {
   p->run(2000);
   p->bus.isolated[1] = true;
   for (int k = 0; k < 24; ++k) {
-    CHECK(p->mgr[0]->reportLocalDetection(fixObs(SensorType::EO, enu(3000.0 * k, 40000.0), 50.0f, 0.7f)));
+    CHECK(reportFix(*p->mgr[0], fixObs(SensorType::EO, enu(3000.0 * k, 40000.0), 50.0f, 0.7f)));
   }
   p->bus.isolated[1] = false;
   p->run(8000);  // four anti-entropy cycles
@@ -1140,34 +1607,33 @@ TEST(packets_that_speak_for_someone_else_are_rejected) {
   p->place(0, 0, 0);
   p->place(1, 0, 5000);
   p->run(2000);
+  // Drone 7 holds the pack key (an insider) but has never been heard ...
+  MeshSecurity insider(7, 1, MeshConfig{});
+  CHECK(insider.installEpochKey(kPackEpoch, kPackKey, 0, kNoExpiry));
   std::array<std::uint8_t, kMaxPacketBytes> buf{};
+  const auto send = [&](const MeshPacket& in) {
+    MeshPacket pkt = in;
+    const std::size_t n = insider.seal(pkt, p->clock.now, buf.data(), buf.size());
+    CHECK(n > 0);
+    CHECK(p->bus.broadcastFrom(1, buf.data(), n));
+  };
   MeshPacket pkt;
-  pkt.header = PacketHeader{7, 1, p->clock.now};  // never-heard sender ...
   SensorObservation o = fixObs(SensorType::IR, enu(9000, 0), 50.0f);
-  o.observer = 1;  // ... claiming to relay drone 1's own reading
+  o.observer = 1;  // ... and claims to relay drone 1's own reading,
   o.observer_position = enu(0, 0);
   o.timestamp_ms = p->clock.now;
   pkt.payload = ObservationPayload{o};
-  std::size_t n = encodePacket(pkt, buf.data(), buf.size());
-  CHECK(n > 0);
-  CHECK(p->bus.broadcastFrom(1, buf.data(), n));
-  // A claim and an alert notice in someone else's name.
-  pkt.payload = TaskClaimPayload{0x00020001u, 2, 0, 0.9f};
-  n = encodePacket(pkt, buf.data(), buf.size());
-  CHECK(p->bus.broadcastFrom(1, buf.data(), n));
-  pkt.payload = AlertIssuedPayload{0x00020001u, AlertLevel::PRIORITY, 2};
-  n = encodePacket(pkt, buf.data(), buf.size());
-  CHECK(p->bus.broadcastFrom(1, buf.data(), n));
+  send(pkt);
+  pkt.payload = TaskClaimPayload{0x00020001u, 2, 0, 0.9f};  // a claim in drone 2's name,
+  send(pkt);
+  pkt.payload = AlertIssuedPayload{0x00020001u, AlertLevel::PRIORITY, 2};  // and an alert notice in it.
+  send(pkt);
+  pkt.payload = TaskClaimPayload{0x00070001u, 7, 0, 1.0e38f};  // An absurd claim score.
+  send(pkt);
   p->run(300);
   CHECK(p->mgr[0]->table().events().empty());
-  CHECK(p->mgr[0]->stats().rx_rejected >= 3);
-
-  // An absurd claim score never even decodes.
-  pkt.header.src = 2;
-  pkt.payload = TaskClaimPayload{0x00020001u, 2, 0, 1.0e38f};
-  n = encodePacket(pkt, buf.data(), buf.size());
-  MeshPacket out;
-  CHECK(n > 0 && !decodePacket(buf.data(), n, out));
+  CHECK(p->mgr[0]->stats().rx_rejected >= 4);
+  CHECK(p->mgr[0]->stats().rx_auth_failed == 0);  // they were authentic; the content was refused
 }
 
 TEST(future_and_expired_timestamps_are_rejected) {
@@ -1183,7 +1649,7 @@ TEST(future_and_expired_timestamps_are_rejected) {
   s.installed_sensors = maskOf(SensorType::IR);
   s.position = enu(0, 0);
   s.timestamp_ms = now + 3'600'000;
-  CHECK(!t.updatePeer(s, 1, now));
+  CHECK(!t.updatePeer(s, 1, 1, now));
   CHECK(t.peerCount() == 0);
 }
 
@@ -1215,7 +1681,7 @@ TEST(full_pack_fits_the_snapshot) {
     s.installed_sensors = maskOf(SensorType::IR);
     s.position = enu(0, 1000.0 * id);
     s.timestamp_ms = now;
-    const bool added = t.updatePeer(s, 1, now);
+    const bool added = t.updatePeer(s, 1, 1, now);
     CHECK(added == (id <= kMaxPackSize));  // 15 peers + self = the full pack
   }
   DroneList dl;
@@ -1234,6 +1700,831 @@ TEST(config_validation) {
   c = MeshConfig{};
   c.peer_timeout_ms = c.heartbeat_period_ms;  // peers would time out between heartbeats
   CHECK(!isValid(c));
+  c = MeshConfig{};
+  c.fix_confirm_count = 0;  // 1 is the least: a fix confirms itself
+  CHECK(!isValid(c));
+}
+
+// ------------------------------------ deterministic re-clustering, partitions
+
+// A table's partition as text: one line per event, "id: observer/sensor@t ...", events by id.
+static void describePartition(const SituationalAwarenessTable& t, char* out, std::size_t cap) {
+  std::array<std::size_t, kMaxEvents> idx{};
+  const auto& events = t.events();
+  for (std::size_t i = 0; i < events.size(); ++i) idx[i] = i;
+  std::sort(idx.begin(), idx.begin() + static_cast<std::ptrdiff_t>(events.size()),
+            [&](std::size_t a, std::size_t b) { return events[a].id < events[b].id; });
+  std::size_t n = 0;
+  out[0] = '\0';
+  for (std::size_t k = 0; k < events.size(); ++k) {
+    const DetectedEvent& ev = events[idx[k]];
+    n += static_cast<std::size_t>(std::snprintf(out + n, cap - n, "%08X:", ev.id));
+    for (const auto& o : ev.observations) {
+      n += static_cast<std::size_t>(std::snprintf(out + n, cap - n, " %u/%u@%llu", o.observer,
+                                                  static_cast<unsigned>(o.sensor),
+                                                  static_cast<unsigned long long>(o.timestamp_ms % 100000)));
+    }
+    n += static_cast<std::size_t>(std::snprintf(out + n, cap - n, "\n"));
+    if (n >= cap) break;
+  }
+}
+
+TEST(reclustering_does_not_depend_on_arrival_order) {
+  // The corner case the README listed: three sources in a row 440 m apart, so
+  // that A-B and B-C pass the association gate but A-C does not. Greedy
+  // association grouped them three different ways depending only on which
+  // reading came first (found by searching spacings with re-clustering off).
+  // Each source is seen by two imagers; every reading carries its observer's id.
+  const TimeMs now = 1'700'000'000'000ULL;
+  std::array<SensorObservation, 6> obs{};
+  const double xs[3] = {0.0, 440.0, 880.0};
+  for (std::size_t s = 0; s < 3; ++s) {
+    for (std::size_t k = 0; k < 2; ++k) {
+      SensorObservation o =
+          fixObs(k == 0 ? SensorType::IR : SensorType::EO, enu(20000.0 + xs[s] + (k == 0 ? -30.0 : 30.0), 5000.0), 60.0f);
+      const auto observer = static_cast<DroneId>(2 + s * 2 + k);
+      obs[s * 2 + k] = tableObs(o, observer, now - 100 * (s * 2 + k), (static_cast<EventId>(observer) << 16U) | 1U);
+    }
+  }
+  std::array<std::size_t, 6> order = {0, 1, 2, 3, 4, 5};
+  std::array<char, 2048> first{};
+  std::array<char, 2048> desc{};
+  int permutations = 0;
+  int differ = 0;
+  do {
+    MeshConfig cfg;
+    auto t = std::make_unique<SituationalAwarenessTable>(1, cfg);
+    for (std::size_t i : order) (void)t->ingestObservation(obs[i], now);
+    t->refresh(now);
+    describePartition(*t, desc.data(), desc.size());
+    if (permutations == 0) first = desc;
+    if (std::strcmp(first.data(), desc.data()) != 0) ++differ;
+    ++permutations;
+  } while (std::next_permutation(order.begin(), order.end()));
+  CHECK(permutations == 720);
+  CHECK(differ == 0);
+  if (differ != 0) std::printf("    first:\n%s    last:\n%s", first.data(), desc.data());
+}
+
+TEST(reclustering_ids_follow_the_readings_not_the_drone) {
+  // Two drones that file the same readings in different orders, under
+  // different local ids, end with the same events under the same ids.
+  const TimeMs now = 1'700'000'000'000ULL;
+  MeshConfig cfg;
+  auto a = std::make_unique<SituationalAwarenessTable>(1, cfg);
+  auto b = std::make_unique<SituationalAwarenessTable>(9, cfg);
+  std::array<SensorObservation, 5> obs{};
+  for (std::size_t k = 0; k < 4; ++k) {
+    SensorObservation o = bearingObs(enu(0, -9000.0 + 6000.0 * k), enu(12000, 3000));
+    o.observer_position = enu(0, -9000.0 + 6000.0 * k);
+    const auto observer = static_cast<DroneId>(2 + k);
+    obs[k] = tableObs(o, observer, now - 50 * k, (static_cast<EventId>(observer) << 16U) | 3U);
+  }
+  obs[4] = tableObs(fixObs(SensorType::IR, enu(12040, 2980), 60.0f), 6, now, 0x00060003u);
+  for (std::size_t k = 0; k < obs.size(); ++k) (void)a->ingestObservation(obs[k], now);
+  for (std::size_t k = obs.size(); k-- > 0;) (void)b->ingestObservation(obs[k], now);
+  a->refresh(now);
+  b->refresh(now);
+  std::array<char, 2048> da{};
+  std::array<char, 2048> db{};
+  describePartition(*a, da.data(), da.size());
+  describePartition(*b, db.data(), db.size());
+  CHECK(std::strcmp(da.data(), db.data()) == 0);
+  CHECK(a->events().size() == 1 && b->events().size() == 1);
+  if (a->events().size() == 1) CHECK(a->events()[0].id == 0x00020003u);  // the lowest id its readings carry
+}
+
+// The observer re-sends its readings under the id its own table now uses, so a
+// peer can hold one reading twice with different hints. It is still one
+// reading: counted twice, the copy stood alone as a phantom event with no
+// frequency, and bearings of any frequency passing near it joined it.
+TEST(one_reading_filed_under_two_ids_is_counted_once) {
+  const TimeMs now = 1'700'000'000'000ULL;
+  MeshConfig cfg;
+  auto t = std::make_unique<SituationalAwarenessTable>(1, cfg);
+  const GeoPoint src = enu(16000, 8000);
+  const SensorObservation fix = tableObs(fixObs(SensorType::IR, src, 70.0f), 4, now, 0x00040001u);
+  const EventId id = t->ingestObservation(fix, now);
+  for (DroneId k = 0; k < 3; ++k) {
+    const GeoPoint from = enu(0, -10000.0 + 10000.0 * k);
+    SensorObservation o = bearingObs(from, src);
+    o.observer_position = from;
+    (void)t->ingestObservation(tableObs(o, static_cast<DroneId>(5 + k), now, 0x00040001u), now);
+  }
+  // A bearing on another frequency that passes 300 m from the fix, filed on its own.
+  const GeoPoint other_from = enu(0, -30000);
+  SensorObservation other = bearingObs(other_from, enu(16000, 7700), 0.0, 433920);
+  other.observer_position = other_from;
+  const EventId o_id = t->ingestObservation(tableObs(other, 9, now, 0x00090001u), now);
+  CHECK(id != kNoEvent && o_id != kNoEvent && o_id != id);
+  // The same fix again, as re-sent under the id the observer's table moved it to.
+  DetectedEvent* host = t->findEvent(o_id);
+  CHECK(host != nullptr);
+  if (host == nullptr) return;
+  SensorObservation copy = fix;
+  copy.event_hint = 0x00040007u;
+  CHECK(host->observations.push_back(copy));
+  t->refresh(now);
+  int holders = 0;
+  for (const auto& ev : t->events()) {
+    for (const auto& o : ev.observations) holders += (o.observer == 4 && o.has_fix) ? 1 : 0;
+    CHECK(!(ev.signature == 433920 && ev.localized && distanceM(ev.position, src) < 1000.0));  // no ISM ghost on the fix
+  }
+  CHECK(holders == 1);
+}
+
+TEST(a_split_event_keeps_its_alerts_with_one_heir) {
+  // A table that grouped two separate sources into one event (as arrival order
+  // once could) is split by the refresh; the event's history goes to one heir.
+  const TimeMs now = 1'700'000'000'000ULL;
+  MeshConfig cfg;
+  auto t = std::make_unique<SituationalAwarenessTable>(1, cfg);
+  const EventId id = t->ingestObservation(tableObs(fixObs(SensorType::IR, enu(30000, 0), 60.0f), 2, now, 0x00020001u), now);
+  CHECK(id == 0x00020001u);
+  DetectedEvent* ev = t->findEvent(id);
+  CHECK(ev != nullptr);
+  if (ev == nullptr) return;
+  // Force a second, far-away reading into the same event, as a stale greedy grouping would have.
+  CHECK(ev->observations.push_back(tableObs(fixObs(SensorType::EO, enu(30000, 9000), 60.0f), 3, now, 0x00030001u)));
+  ev->advisory_sent = true;
+  t->refresh(now);
+  CHECK(t->events().size() == 2);
+  int with_flag = 0;
+  for (const auto& e : t->events()) with_flag += e.advisory_sent ? 1 : 0;
+  CHECK(with_flag == 1);
+  const DetectedEvent* heir = t->findEvent(0x00020001u);
+  CHECK(heir != nullptr && heir->advisory_sent);
+  CHECK(t->findEvent(0x00030001u) != nullptr);
+}
+
+TEST(one_drone_hearing_two_sources_on_one_frequency_keeps_both) {
+  // One DF hears two beacons on 406.025 MHz at very different bearings before
+  // either is localised. Readings are keyed by (observer, sensor), so the
+  // second must not overwrite the first.
+  const TimeMs now = 1'700'000'000'000ULL;
+  MeshConfig cfg;
+  auto t = std::make_unique<SituationalAwarenessTable>(1, cfg);
+  SensorObservation north = bearingObs(enu(0, 0), enu(2000, 20000));
+  north.observer_position = enu(0, 0);
+  SensorObservation south = bearingObs(enu(0, 0), enu(3000, -20000));
+  south.observer_position = enu(0, 0);
+  const EventId a = t->ingestObservation(tableObs(north, 2, now, 0x00020001u), now);
+  const EventId b = t->ingestObservation(tableObs(south, 2, now + 10, 0x00020002u), now + 10);
+  CHECK(a != kNoEvent && b != kNoEvent && a != b);
+  t->refresh(now + 10);
+  CHECK(t->events().size() == 2);
+  // A later reading of the northern beacon still updates its own event.
+  SensorObservation north2 = north;
+  north2.bearing_deg += 0.5f;
+  CHECK(t->ingestObservation(tableObs(north2, 2, now + 2000, 0x00020001u), now + 2000) == a);
+  t->refresh(now + 2000);
+  CHECK(t->events().size() == 2);
+}
+
+// Six drones in two groups of three, 6 km apart in each group; both groups can hear the beacon.
+static void placeTwoGroups(Pack& p) {
+  for (std::size_t i = 0; i < 6; ++i) p.place(i, 0, -15000.0 + 6000.0 * static_cast<double>(i));
+}
+
+static std::size_t verifyingCount(const Pack& p) {
+  std::size_t n = 0;
+  for (std::size_t i = 0; i < p.n; ++i) n += p.mgr[i]->isVerifying() ? 1 : 0;
+  return n;
+}
+
+TEST(partition_then_heal_converges_to_one_event) {
+  auto p = std::make_unique<Pack>(6);
+  placeTwoGroups(*p);
+  p->run(2000);
+  for (std::size_t i = 3; i < 6; ++i) p->bus.group[i] = 1;  // split the mesh: {1,2,3} | {4,5,6}
+  p->run(6000);                                            // each side times the other out
+  CHECK(p->mgr[0]->table().peerCount() == 2 && p->mgr[3]->table().peerCount() == 2);
+  reportBeacon(*p, {0, 1, 2, 3, 4, 5});
+  p->run(5000 + MeshConfig{}.advisory_bearing_hold_ms);
+  // Each side localised the beacon under its own id and warned the GMCS.
+  const EventId id_a = soleEvent(*p->mgr[0]) != nullptr ? soleEvent(*p->mgr[0])->id : kNoEvent;
+  const EventId id_b = soleEvent(*p->mgr[3]) != nullptr ? soleEvent(*p->mgr[3])->id : kNoEvent;
+  CHECK(id_a != kNoEvent && id_b != kNoEvent && id_a != id_b);
+  CHECK(p->totalAlerts(AlertLevel::ADVISORY) == 2);  // one per side: the GMCS must de-duplicate
+  CHECK(verifyingCount(*p) <= 4);
+
+  for (auto& g : p->bus.group) g = 0;  // heal
+  p->run(8000);
+  const DetectedEvent* ref = soleEvent(*p->mgr[0]);
+  CHECK(ref != nullptr);
+  if (ref == nullptr) return;
+  CHECK(ref->id == (id_a < id_b ? id_a : id_b));
+  CHECK(ref->observations.size() == 6);
+  for (std::size_t i = 0; i < 6; ++i) {
+    const DetectedEvent* ev = soleEvent(*p->mgr[i]);
+    CHECK(ev != nullptr);
+    if (ev == nullptr) continue;
+    CHECK(ev->id == ref->id);
+    CHECK(ev->verifier[0].id == ref->verifier[0].id && ev->verifier[1].id == ref->verifier[1].id);
+    CHECK(p->mgr[i]->table().peerCount() == 5);
+    // Each side's old id still resolves there, so a late claim or alert notice quoting it lands.
+    CHECK(p->mgr[i]->table().resolve(i < 3 ? id_a : id_b) == ref->id);
+  }
+  CHECK(verifyingCount(*p) <= 2);  // the merged plan sends at most two
+  CHECK(p->totalAlerts(AlertLevel::ADVISORY) == 2);  // and nobody warns again
+
+  // Confirmation after the heal produces exactly one PRIORITY.
+  const GeoPoint truth = enu(kTruthE, kTruthN);
+  CHECK(reportFix(*p->mgr[1], fixObs(SensorType::IR, truth, 60.0f)));
+  CHECK(reportFix(*p->mgr[4], fixObs(SensorType::EO, enu(kTruthE - 30.0, kTruthN + 20.0), 60.0f)));
+  p->run(10000);
+  CHECK(p->totalAlerts(AlertLevel::PRIORITY) == 1);
+}
+
+TEST(partition_during_verification_reconciles_tasks) {
+  auto p = std::make_unique<Pack>(6);
+  placeTwoGroups(*p);
+  p->run(2000);
+  reportBeacon(*p, {0, 1, 2, 3, 4, 5});
+  p->run(4000);
+  const std::size_t before = verifyingCount(*p);
+  CHECK(before >= 1 && before <= 2);
+
+  for (std::size_t i = 3; i < 6; ++i) p->bus.group[i] = 1;
+  p->run(9000);  // each side loses sight of the other's verifiers and plans on its own
+  CHECK(verifyingCount(*p) <= 4);
+
+  for (auto& g : p->bus.group) g = 0;
+  p->run(10000);
+  CHECK(verifyingCount(*p) >= 1 && verifyingCount(*p) <= 2);
+  const DetectedEvent* ref = soleEvent(*p->mgr[0]);
+  CHECK(ref != nullptr);
+  if (ref == nullptr) return;
+  for (std::size_t i = 0; i < 6; ++i) {
+    const DetectedEvent* ev = soleEvent(*p->mgr[i]);
+    CHECK(ev != nullptr && ev->id == ref->id && ev->verifier[0].id == ref->verifier[0].id &&
+          ev->verifier[1].id == ref->verifier[1].id);
+    // Every drone that is still verifying holds one of the agreed slots.
+    if (p->mgr[i]->isVerifying()) {
+      const auto self = static_cast<DroneId>(i + 1);
+      CHECK(ref->verifier[0].id == self || ref->verifier[1].id == self);
+    }
+  }
+}
+
+TEST(dismissal_during_partition_reaches_the_other_side_on_heal) {
+  auto p = std::make_unique<Pack>(6);
+  placeTwoGroups(*p);
+  p->run(2000);
+  const std::uint32_t kIsm = 433920;
+  const GeoPoint truth = enu(kTruthE, kTruthN);
+  for (std::size_t i = 0; i < 6; ++i) {
+    SensorObservation o = bearingObs(p->mgr[i]->exportedState().position, truth, 0.0, kIsm);
+    o.class_hint = EventClass::RF_EMITTER;
+    CHECK(p->mgr[i]->reportLocalDetection(o));
+  }
+  p->run(3000);
+  for (std::size_t i = 3; i < 6; ++i) p->bus.group[i] = 1;
+  p->run(1000);
+  p->mgr[0]->applyGmcsDismissal(kIsm);  // the operator's uplink reaches side A only
+  p->run(3000);
+  for (std::size_t i = 0; i < 3; ++i) CHECK(p->mgr[i]->table().isBenign(kIsm));
+  for (std::size_t i = 3; i < 6; ++i) CHECK(!p->mgr[i]->table().isBenign(kIsm));
+  for (auto& g : p->bus.group) g = 0;
+  p->run(5000);
+  for (std::size_t i = 0; i < 6; ++i) {
+    CHECK(p->mgr[i]->table().isBenign(kIsm));
+    CHECK(!p->mgr[i]->isVerifying());
+  }
+}
+
+// ------------------------- fixes found by the realistic simulation (sim/)
+
+TEST(two_bearings_alone_never_raise_an_advisory) {
+  // Two lines always cross: two reflected bearings make a convincing ghost.
+  MeshConfig cfg;
+  DetectedEvent ev;
+  ev.id = 1;
+  ev.cls = EventClass::DISTRESS_BEACON;
+  const GeoPoint truth = enu(10000, 2000);
+  for (DroneId k = 0; k < 2; ++k) {
+    SensorObservation o = bearingObs(enu(0, -6000.0 + 12000.0 * k), truth);
+    o.observer = static_cast<DroneId>(2 + k);
+    o.observer_position = enu(0, -6000.0 + 12000.0 * k);
+    CHECK(ev.observations.push_back(o));
+  }
+  fuseEvent(ev, cfg);
+  CHECK(ev.localized && ev.confidence >= 0.6f);
+  CHECK(evaluateAlertLevel(ev, false, cfg) == AlertLevel::NONE);
+  SensorObservation third = bearingObs(enu(-3000, 0), truth);
+  third.observer = 4;
+  third.observer_position = enu(-3000, 0);
+  CHECK(ev.observations.push_back(third));
+  fuseEvent(ev, cfg);
+  CHECK(evaluateAlertLevel(ev, false, cfg) == AlertLevel::ADVISORY);
+}
+
+TEST(a_bearing_through_a_clutter_fix_does_not_confirm_it) {
+  // One false IR detection plus DF bearings that pass near it (towards another source
+  // on the frequency) must not make a PRIORITY: the bearings belong to that source.
+  MeshConfig cfg;
+  auto t = std::make_unique<SituationalAwarenessTable>(1, cfg);
+  const TimeMs now = 1'700'000'000'000ULL;
+  const GeoPoint beacon = enu(20000, 0);
+  // The real beacon, localised by four bearings.
+  for (DroneId k = 0; k < 4; ++k) {
+    SensorObservation o = bearingObs(enu(0, -9000.0 + 6000.0 * k), beacon);
+    o.observer_position = enu(0, -9000.0 + 6000.0 * k);
+    (void)t->ingestObservation(tableObs(o, static_cast<DroneId>(2 + k), now, 0x00020001u), now);
+  }
+  // A clutter fix 4 km beyond the beacon, on the line from drone 2 and drone 3.
+  SensorObservation clutter = fixObs(SensorType::IR, enu(24000, -400), 60.0f, 0.8f);
+  clutter.class_hint = EventClass::THERMAL_HAZARD;
+  (void)t->ingestObservation(tableObs(clutter, 9, now), now);
+  t->refresh(now);
+  for (const auto& ev : t->events()) {
+    CHECK(evaluateAlertLevel(ev, false, cfg, t.get()) != AlertLevel::PRIORITY);
+  }
+}
+
+TEST(a_newer_reading_supersedes_the_old_and_a_stale_reflection_ages_out) {
+  MeshConfig cfg;
+  auto t = std::make_unique<SituationalAwarenessTable>(1, cfg);
+  const TimeMs now = 1'700'000'000'000ULL;
+  const GeoPoint beacon = enu(15000, 3000);
+  for (DroneId k = 0; k < 4; ++k) {
+    SensorObservation o = bearingObs(enu(0, -9000.0 + 6000.0 * k), beacon);
+    o.observer_position = enu(0, -9000.0 + 6000.0 * k);
+    (void)t->ingestObservation(tableObs(o, static_cast<DroneId>(2 + k), now, 0x00020001u), now);
+  }
+  // Drone 2 is in a reflection for one reading (25 deg off), then sees the source directly again.
+  SensorObservation reflected = bearingObs(enu(0, -9000), beacon, 25.0);
+  reflected.observer_position = enu(0, -9000);
+  (void)t->ingestObservation(tableObs(reflected, 2, now + 2000, 0x00020001u), now + 2000);
+  SensorObservation direct = bearingObs(enu(0, -9000), beacon, 0.5);
+  direct.observer_position = enu(0, -9000);
+  (void)t->ingestObservation(tableObs(direct, 2, now + 4000, 0x00020001u), now + 4000);
+  t->refresh(now + 4000);
+  std::size_t from_two = 0;
+  for (const auto& ev : t->events()) {
+    for (const auto& o : ev.observations) from_two += o.observer == 2 ? 1 : 0;
+  }
+  CHECK(from_two == 2);  // the old direct reading is superseded; the reflection still looks like a second source
+  // The drone keeps reporting the source directly; the reflection is never reported again.
+  const TimeMs later = now + 4000 + cfg.same_sensor_supersede_ms + 1;
+  SensorObservation direct2 = bearingObs(enu(0, -9000), beacon, -0.4);
+  direct2.observer_position = enu(0, -9000);
+  (void)t->ingestObservation(tableObs(direct2, 2, later, 0x00020001u), later);
+  t->refresh(later);
+  from_two = 0;
+  for (const auto& ev : t->events()) {
+    for (const auto& o : ev.observations) from_two += o.observer == 2 ? 1 : 0;
+  }
+  CHECK(from_two == 1);  // the drone stopped reporting it: a reflection, not a source
+}
+
+TEST(a_source_already_alerted_is_not_alerted_again_once_its_readings_age_out) {
+  MeshConfig cfg;
+  auto t = std::make_unique<SituationalAwarenessTable>(1, cfg);
+  const TimeMs now = 1'700'000'000'000ULL;
+  const GeoPoint at = enu(12000, 4000);
+  const EventId id = t->ingestObservation(tableObs(fixObs(SensorType::IR, at, 60.0f), 2, now, 0x00020001u), now);
+  t->refresh(now);
+  t->markAlertSent(id, AlertLevel::PRIORITY);
+  // Every reading expires; later a different drone sees the same source under a new id.
+  const TimeMs later = now + cfg.observation_max_age_ms + 5000;
+  t->refresh(later);
+  CHECK(t->events().empty());
+  const EventId again = t->ingestObservation(tableObs(fixObs(SensorType::EO, enu(12040, 3980), 60.0f), 3, later, 0x00030009u), later);
+  t->refresh(later);
+  const DetectedEvent* ev = t->findEvent(again);
+  CHECK(ev != nullptr && again != id);
+  if (ev != nullptr) {
+    CHECK(ev->priority_sent && ev->advisory_sent);  // remembered by place
+    CHECK(!eligibleForTasking(*ev, later, cfg));    // and no aircraft is sent to it again
+  }
+}
+
+TEST(a_second_event_on_a_localised_frequency_waits_its_turn) {
+  MeshConfig cfg;
+  auto t = std::make_unique<SituationalAwarenessTable>(1, cfg);
+  const TimeMs now = 1'700'000'000'000ULL;
+  const GeoPoint main_src = enu(15000, 0);
+  for (DroneId k = 0; k < 4; ++k) {
+    SensorObservation o = bearingObs(enu(0, -9000.0 + 6000.0 * k), main_src);
+    o.observer_position = enu(0, -9000.0 + 6000.0 * k);
+    (void)t->ingestObservation(tableObs(o, static_cast<DroneId>(2 + k), now, 0x00020001u), now);
+  }
+  SensorObservation lone = bearingObs(enu(0, 30000), enu(20000, 45000));  // far off, same frequency
+  lone.observer_position = enu(0, 30000);
+  (void)t->ingestObservation(tableObs(lone, 9, now, 0x00090001u), now);
+  t->refresh(now);
+  updateUrgencies(*t, now);
+  const DetectedEvent* big = nullptr;
+  const DetectedEvent* small = nullptr;
+  for (const auto& ev : t->events()) (ev.observer_count >= 4 ? big : small) = &ev;
+  CHECK(big != nullptr && small != nullptr);
+  if (big == nullptr || small == nullptr) return;
+  CHECK(small->urgency < 0.6f * big->urgency);
+  // And a lone bearing on that frequency is not worth an aircraft.
+  DroneList drones;
+  for (DroneId id = 2; id <= 6; ++id) {
+    DroneState d;
+    d.id = id;
+    d.mode = DroneMode::PACK_ROUTING;
+    d.installed_sensors = maskOf(SensorType::IR);
+    d.position = enu(0, -3000.0 * id);
+    d.speed_mps = 40.0f;
+    d.endurance_remaining_s = 4.0f * 3600.0f;
+    d.bingo_endurance_s = 1800.0f;
+    CHECK(drones.push_back(d));
+  }
+  MeshConfig roomy = cfg;
+  roomy.max_diversion_fraction = 1.0;  // so the diversion budget does not hide the rule
+  AssignmentList plan;
+  planAssignments(*t, drones, now, roomy, plan);
+  CHECK(plan.size() >= 2);
+  for (const auto& a : plan) CHECK(a.event_id != small->id);
+
+}
+
+// Two bearings always cross somewhere. On a frequency the pack has localised
+// better elsewhere, such a crossing is not worth an aircraft until a third
+// bearing agrees (in the realistic storyline, two reflected bearings on the
+// confirmed beacon's frequency pulled a verifier off for a ghost).
+TEST(two_crossing_bearings_on_a_localised_frequency_wait_for_a_third) {
+  MeshConfig cfg;
+  cfg.max_diversion_fraction = 1.0;  // so the diversion budget does not hide the rule
+  auto t = std::make_unique<SituationalAwarenessTable>(1, cfg);
+  const TimeMs now = 1'700'000'000'000ULL;
+  const auto add = [&](const GeoPoint& from, const GeoPoint& to, DroneId who) {
+    SensorObservation o = bearingObs(from, to);
+    o.observer_position = from;
+    (void)t->ingestObservation(tableObs(o, who, now, (static_cast<EventId>(who) << 16) | 1U), now);
+  };
+  const GeoPoint main_src = enu(15000, 0);
+  for (DroneId k = 0; k < 4; ++k) add(enu(0, -9000.0 + 6000.0 * k), main_src, static_cast<DroneId>(2 + k));
+  const GeoPoint ghost = enu(20000, -30000);
+  add(enu(0, -24000), ghost, 20);
+  add(enu(0, -36000), ghost, 21);
+  t->refresh(now);
+  updateUrgencies(*t, now);
+  DroneList drones;
+  for (DroneId id = 2; id <= 7; ++id) {
+    DroneState d;
+    d.id = id;
+    d.mode = DroneMode::PACK_ROUTING;
+    d.installed_sensors = maskOf(SensorType::IR);
+    d.position = enu(0, -6000.0 * id);
+    d.speed_mps = 40.0f;
+    d.endurance_remaining_s = 4.0f * 3600.0f;
+    d.bingo_endurance_s = 1800.0f;
+    CHECK(drones.push_back(d));
+  }
+  const auto near_ghost = [&](std::size_t observers) -> const DetectedEvent* {
+    for (const auto& ev : t->events()) {
+      if (ev.localized && ev.observer_count == observers && distanceM(ev.position, ghost) < 3000.0) return &ev;
+    }
+    return nullptr;
+  };
+  const DetectedEvent* pair = near_ghost(2);
+  CHECK(pair != nullptr);
+  if (pair == nullptr) return;
+  CHECK(pair->urgency >= cfg.min_task_urgency);  // urgent enough: only the rule keeps it untasked
+  const EventId pair_id = pair->id;
+  AssignmentList plan;
+  planAssignments(*t, drones, now, cfg, plan);
+  CHECK(!plan.empty());
+  for (const auto& a : plan) CHECK(a.event_id != pair_id);
+
+  add(enu(0, -18000), ghost, 22);  // a third bearing agrees
+  t->refresh(now);
+  updateUrgencies(*t, now);
+  const DetectedEvent* trio = near_ghost(3);
+  CHECK(trio != nullptr);
+  if (trio == nullptr) return;
+  planAssignments(*t, drones, now, cfg, plan);
+  bool tasked = false;
+  for (const auto& a : plan) tasked = tasked || a.event_id == trio->id;
+  CHECK(tasked);
+}
+
+TEST(verifiers_keep_their_roles_and_claim_before_flying) {
+  auto p = std::make_unique<Pack>(5);
+  placeLine(*p);
+  p->run(2000);
+  reportBeacon(*p, {1, 2, 3, 4});
+  // Claim before flying: nobody asks the FCS to divert in the first second.
+  p->run(1000);
+  for (std::size_t i = 0; i < 5; ++i) CHECK(p->guidance[i].requests == 0);
+  // Keep the bearings coming for a minute with noise; the two verifiers keep their roles.
+  for (int round = 0; round < 30; ++round) {
+    const GeoPoint truth = enu(kTruthE, kTruthN);
+    for (std::size_t i = 1; i < 5; ++i) {
+      const double noise = static_cast<double>((round * 5 + static_cast<int>(i) * 3) % 7 - 3) * 0.7;
+      CHECK(p->mgr[i]->reportLocalDetection(bearingObs(p->mgr[i]->exportedState().position, truth, noise)));
+    }
+    p->run(2000);
+  }
+  int verifying = 0;
+  int requests = 0;
+  for (std::size_t i = 0; i < 5; ++i) {
+    verifying += p->mgr[i]->isVerifying() ? 1 : 0;
+    requests += p->guidance[i].requests;
+    CHECK(p->guidance[i].requests <= 2);  // no primary/secondary swapping
+  }
+  CHECK(verifying >= 1 && requests >= 1);
+}
+
+TEST(a_backup_that_missed_the_alert_notice_still_stands_down) {
+  // The owner's ALERT_ISSUED is lost; it is repeated by anti-entropy, so the
+  // backup that would have alerted a few seconds later does not.
+  auto p = std::make_unique<Pack>(5);
+  placeLine(*p);
+  p->run(2000);
+  reportBeacon(*p, {1, 2, 3, 4});
+  p->run(MeshConfig{}.advisory_bearing_hold_ms - 500);
+  p->bus.drop_permille = 1000;  // the notice goes nowhere
+  p->run(1200);
+  p->bus.drop_permille = 0;
+  p->run(15000);
+  CHECK(p->totalAlerts(AlertLevel::ADVISORY) == 1);
+}
+
+TEST(bearings_that_belong_to_other_sources_do_not_corroborate) {
+  // Two beacons on one frequency. One bearing towards each crosses at a clutter
+  // fix; each bearing is better explained by its own beacon, so the crossing
+  // confirms nothing (two bearings allowed here, to isolate that rule).
+  MeshConfig cfg;
+  cfg.priority_min_bearings = 2;
+  auto t = std::make_unique<SituationalAwarenessTable>(1, cfg);
+  const TimeMs now = 1'700'000'000'000ULL;
+  const GeoPoint b1 = enu(20000, 10000);
+  const GeoPoint b2 = enu(20000, -10000);
+  DroneId observer = 2;
+  for (const GeoPoint& b : {b1, b2}) {
+    for (int k = 0; k < 3; ++k) {  // spread out, so each beacon is triangulated on its own
+      const GeoPoint from = enu(-10000.0 + 15000.0 * k, b.lat_deg > kOrigin.lat_deg ? 30000.0 : -30000.0);
+      SensorObservation o = bearingObs(from, b);
+      o.observer_position = from;
+      (void)t->ingestObservation(tableObs(o, observer, now, (static_cast<EventId>(observer) << 16U) | 1U), now);
+      ++observer;
+    }
+  }
+  // Bearings from (0, 10 km) towards b2 and from (0, -10 km) towards b1 cross near (10, 0) km.
+  SensorObservation x = bearingObs(enu(0, 10000), b2);
+  x.observer_position = enu(0, 10000);
+  SensorObservation y = bearingObs(enu(0, -10000), b1);
+  y.observer_position = enu(0, -10000);
+  (void)t->ingestObservation(tableObs(x, 20, now), now);
+  (void)t->ingestObservation(tableObs(y, 21, now), now);
+  SensorObservation clutter = fixObs(SensorType::IR, enu(10000, 150), 60.0f, 0.8f);
+  clutter.class_hint = EventClass::THERMAL_HAZARD;
+  (void)t->ingestObservation(tableObs(clutter, 22, now), now);
+  t->refresh(now);
+  int priority = 0;
+  for (const auto& ev : t->events()) priority += evaluateAlertLevel(ev, false, cfg, t.get()) == AlertLevel::PRIORITY ? 1 : 0;
+  CHECK(priority == 0);
+}
+
+TEST(incumbency_is_per_slot) {
+  // The current primary keeps the primary role against the current secondary,
+  // even when the secondary is slightly better placed.
+  MeshConfig cfg;
+  auto t = std::make_unique<SituationalAwarenessTable>(1, cfg);
+  const TimeMs now = 1'700'000'000'000ULL;
+  SensorObservation o = fixObs(SensorType::RF_DF, enu(0, 0), 60.0f, 0.9f);
+  o.sensor = SensorType::ANOMALY;
+  o.class_hint = EventClass::THERMAL_HAZARD;
+  const EventId id = t->ingestObservation(tableObs(o, 9, now, 0x00090001u), now);
+  t->refresh(now);
+  updateUrgencies(*t, now);
+  DetectedEvent* ev = t->findEvent(id);
+  CHECK(ev != nullptr && ev->urgency >= cfg.dual_verifier_urgency);
+  if (ev == nullptr) return;
+  ev->verifier[0] = VerifierSlot{2, 0.5f, now};  // drone 2 is primary
+  ev->verifier[1] = VerifierSlot{3, 0.5f, now};  // drone 3 secondary, and a little closer
+  DroneList drones;
+  for (DroneId id2 = 2; id2 <= 3; ++id2) {
+    DroneState d;
+    d.id = id2;
+    d.mode = DroneMode::VERIFYING;
+    d.installed_sensors = maskOf(SensorType::IR);
+    d.position = enu(-12000.0 + 400.0 * id2, 0);
+    d.speed_mps = 40.0f;
+    d.endurance_remaining_s = 4.0f * 3600.0f;
+    d.bingo_endurance_s = 1800.0f;
+    d.tasked_event = id;
+    CHECK(drones.push_back(d));
+  }
+  cfg.max_diversion_fraction = 1.0;
+  AssignmentList plan;
+  planAssignments(*t, drones, now, cfg, plan);
+  CHECK(plan.size() == 2);
+  for (const auto& a : plan) CHECK((a.drone == 2 && a.role == 0) || (a.drone == 3 && a.role == 1));
+}
+
+// ------------------------------------------------- GMCS-side alert consumer
+
+struct FakeUplink : gmcs::IUplink {
+  std::array<std::uint32_t, 16> sent{};
+  std::size_t n = 0;
+  bool fail = false;
+  bool sendDismissal(std::uint32_t signature) override {
+    if (fail || n >= sent.size()) return false;
+    sent[n++] = signature;
+    return true;
+  }
+};
+
+static GmcsAlert makeAlert(EventId id, AlertLevel level, const GeoPoint& at, float cep, std::uint32_t sig, TimeMs issued,
+                           TimeMs first_seen = 0) {
+  GmcsAlert a;
+  a.event_id = id;
+  a.level = level;
+  a.cls = EventClass::DISTRESS_BEACON;
+  a.position = at;
+  a.cep_m = cep;
+  a.confidence = level == AlertLevel::PRIORITY ? 0.99f : 0.85f;
+  a.signature = sig;
+  a.issuer = 3;
+  a.first_seen_ms = first_seen;
+  a.timestamp_ms = issued;
+  return a;
+}
+
+TEST(gmcs_folds_duplicates_by_id_and_by_place) {
+  FakeUplink up;
+  gmcs::AlertConsumer c(gmcs::ConsumerConfig{}, up);
+  const TimeMs t0 = 1'700'000'000'000ULL;
+  const GeoPoint p = enu(16000, 8000);
+  CHECK(c.onAlert(makeAlert(0x027101, AlertLevel::ADVISORY, p, 700.0f, 406025, t0, t0 - 9000), LinkType::LOS, t0 + 70) ==
+        gmcs::IngestResult::NEW_RECORD);
+  // The same id again (a backup that missed the notice): a duplicate.
+  CHECK(c.onAlert(makeAlert(0x027101, AlertLevel::ADVISORY, p, 700.0f, 406025, t0 + 3000), LinkType::LEO, t0 + 3200) ==
+        gmcs::IngestResult::DUPLICATE);
+  // The other side of a mesh partition, under its own id, 600 m away: same source.
+  CHECK(c.onAlert(makeAlert(0x057101, AlertLevel::ADVISORY, enu(16500, 8300), 800.0f, 406025, t0 + 5000), LinkType::LOS,
+                  t0 + 5060) == gmcs::IngestResult::DUPLICATE);
+  CHECK(c.records().size() == 1);
+  CHECK(c.stats().merged_by_place == 1);
+  const gmcs::Record* r = c.findByEvent(0x057101);
+  CHECK(r != nullptr && r == c.findByEvent(0x027101) && r->event_ids.size() == 2 && r->reports == 3);
+  // A second beacon on the same frequency 40 km away is another record; a
+  // different frequency next door is too.
+  CHECK(c.onAlert(makeAlert(0x037101, AlertLevel::ADVISORY, enu(56000, 8000), 700.0f, 406025, t0 + 6000), LinkType::LOS,
+                  t0 + 6050) == gmcs::IngestResult::NEW_RECORD);
+  CHECK(c.onAlert(makeAlert(0x047101, AlertLevel::ADVISORY, enu(16200, 8100), 700.0f, 121500, t0 + 6000), LinkType::LOS,
+                  t0 + 6050) == gmcs::IngestResult::NEW_RECORD);
+  CHECK(c.records().size() == 3);
+  // The PRIORITY upgrades the first record and needs the operator again; a
+  // better estimate at the same level only updates it.
+  CHECK(c.acknowledge(r->record_id, t0 + 9000));
+  CHECK(c.find(r->record_id)->state == gmcs::RecordState::ACKNOWLEDGED);
+  CHECK(c.onAlert(makeAlert(0x027101, AlertLevel::PRIORITY, enu(16030, 7980), 70.0f, 406025, t0 + 300000), LinkType::LOS,
+                  t0 + 300080) == gmcs::IngestResult::UPGRADED);
+  r = c.findByEvent(0x027101);
+  CHECK(r != nullptr && r->state == gmcs::RecordState::NEW && r->level == AlertLevel::PRIORITY && r->cep_m == 70.0f);
+  CHECK(c.onAlert(makeAlert(0x027101, AlertLevel::PRIORITY, enu(16020, 7990), 40.0f, 406025, t0 + 310000), LinkType::LOS,
+                  t0 + 310060) == gmcs::IngestResult::UPDATED);
+  CHECK(c.stats().alerts == 7 && c.stats().records == 3 && c.stats().upgrades == 1 && c.stats().updates == 1);
+}
+
+TEST(gmcs_acknowledgement_deadlines_escalate) {
+  FakeUplink up;
+  gmcs::ConsumerConfig cfg;
+  gmcs::AlertConsumer c(cfg, up);
+  const TimeMs t0 = 1'700'000'000'000ULL;
+  CHECK(c.onAlert(makeAlert(1, AlertLevel::PRIORITY, enu(0, 0), 70.0f, 0, t0), LinkType::LOS, t0) == gmcs::IngestResult::NEW_RECORD);
+  CHECK(c.onAlert(makeAlert(2, AlertLevel::ADVISORY, enu(30000, 0), 700.0f, 0, t0), LinkType::LOS, t0) == gmcs::IngestResult::NEW_RECORD);
+  c.tick(t0 + cfg.ack_deadline_priority_ms + 1);
+  CHECK(c.stats().escalations == 1);  // the PRIORITY, not yet the ADVISORY
+  CHECK(c.findByEvent(1)->escalated && !c.findByEvent(2)->escalated);
+  CHECK(c.acknowledge(c.findByEvent(2)->record_id, t0 + 60000));
+  c.tick(t0 + cfg.ack_deadline_advisory_ms + 1);
+  CHECK(c.stats().escalations == 1);  // acknowledged in time
+  CHECK(c.openCount() == 1);
+  CHECK(c.stats().operator_ack.count() == 1 && std::fabs(c.stats().operator_ack.mean() - 60000.0) < 1.0);
+}
+
+TEST(gmcs_dismissal_teaches_the_pack_and_suppresses) {
+  FakeUplink up;
+  gmcs::ConsumerConfig cfg;
+  gmcs::AlertConsumer c(cfg, up);
+  const TimeMs t0 = 1'700'000'000'000ULL;
+  CHECK(c.onAlert(makeAlert(1, AlertLevel::ADVISORY, enu(0, 0), 700.0f, 433920, t0), LinkType::LOS, t0) == gmcs::IngestResult::NEW_RECORD);
+  const std::uint32_t rec = c.findByEvent(1)->record_id;
+  // The C2 link is down at first: the uplink is retried until it is accepted.
+  up.fail = true;
+  CHECK(c.dismiss(rec, t0 + 1000));
+  CHECK(c.uplinkPending() && c.stats().uplink_failures == 1);
+  c.tick(t0 + 2000);
+  CHECK(c.stats().uplink_failures == 1);  // not before the retry interval
+  up.fail = false;
+  c.tick(t0 + 1000 + cfg.uplink_retry_ms);
+  CHECK(!c.uplinkPending() && up.n == 1 && up.sent[0] == 433920u);
+  // Later alerts on that frequency, anywhere, are suppressed.
+  CHECK(c.onAlert(makeAlert(9, AlertLevel::ADVISORY, enu(5000, 0), 700.0f, 433920, t0 + 60000), LinkType::LOS, t0 + 60000) ==
+        gmcs::IngestResult::SUPPRESSED);
+  // A thermal source with no frequency can only be suppressed here, by place.
+  CHECK(c.onAlert(makeAlert(2, AlertLevel::ADVISORY, enu(40000, 0), 70.0f, 0, t0), LinkType::LOS, t0) == gmcs::IngestResult::NEW_RECORD);
+  CHECK(c.dismiss(c.findByEvent(2)->record_id, t0 + 1000));
+  CHECK(up.n == 1);  // nothing to teach the pack
+  CHECK(c.onAlert(makeAlert(3, AlertLevel::ADVISORY, enu(40300, 0), 70.0f, 0, t0 + 9000), LinkType::LOS, t0 + 9000) ==
+        gmcs::IngestResult::SUPPRESSED);
+  CHECK(c.onAlert(makeAlert(4, AlertLevel::ADVISORY, enu(48000, 0), 70.0f, 0, t0 + 9000), LinkType::LOS, t0 + 9000) ==
+        gmcs::IngestResult::NEW_RECORD);
+  // A frequency the pack never alerted on (known from elsewhere) can be dismissed too.
+  CHECK(c.dismissSignature(162550, t0 + 10000) && up.n == 2 && up.sent[1] == 162550u);
+  CHECK(c.stats().suppressed == 2);
+}
+
+TEST(gmcs_latency_accounting) {
+  FakeUplink up;
+  gmcs::AlertConsumer c(gmcs::ConsumerConfig{}, up);
+  const TimeMs t0 = 1'700'000'000'000ULL;
+  for (int k = 0; k < 10; ++k) {
+    const TimeMs issued = t0 + static_cast<TimeMs>(k) * 100000;
+    (void)c.onAlert(makeAlert(static_cast<EventId>(100 + k), AlertLevel::ADVISORY, enu(10000.0 * k, 0), 500.0f, 0, issued,
+                              issued - 12000),
+                    k % 2 == 0 ? LinkType::LOS : LinkType::GEO, issued + (k % 2 == 0 ? 60 : 650));
+  }
+  const auto& los = c.stats().transport[0];
+  const auto& geo = c.stats().transport[2];
+  CHECK(los.count() == 5 && geo.count() == 5);
+  CHECK(std::fabs(los.mean() - 60.0) < 1e-9 && std::fabs(geo.mean() - 650.0) < 1e-9);
+  CHECK(los.percentile(50) >= 50.0 && los.percentile(50) <= 60.0);
+  CHECK(geo.min() == 650.0 && geo.max() == 650.0 && geo.percentile(95) == 650.0);
+  const auto& det = c.stats().detection_to_gmcs[1];
+  CHECK(det.count() == 10 && det.min() == 12060.0 && det.max() == 12650.0);
+  // A histogram's percentiles stay inside the observed range and are monotonic.
+  gmcs::LatencyStats s;
+  for (int k = 1; k <= 1000; ++k) s.add(k);
+  CHECK(s.percentile(5) <= s.percentile(50) && s.percentile(50) <= s.percentile(95));
+  CHECK(s.percentile(50) > 300.0 && s.percentile(50) < 700.0 && s.percentile(100) == 1000.0);
+}
+
+TEST(gmcs_keeps_room_for_open_records) {
+  FakeUplink up;
+  gmcs::AlertConsumer c(gmcs::ConsumerConfig{}, up);
+  const TimeMs t0 = 1'700'000'000'000ULL;
+  for (std::size_t k = 0; k < gmcs::kMaxRecords; ++k) {
+    (void)c.onAlert(makeAlert(static_cast<EventId>(k + 1), AlertLevel::PRIORITY, enu(5000.0 * static_cast<double>(k), 90000),
+                              70.0f, 0, t0),
+                    LinkType::LOS, t0);
+  }
+  CHECK(c.records().size() == gmcs::kMaxRecords);
+  // Every record is an open PRIORITY: a new one cannot push one out.
+  CHECK(c.onAlert(makeAlert(999, AlertLevel::PRIORITY, enu(0, -90000), 70.0f, 0, t0), LinkType::LOS, t0) ==
+        gmcs::IngestResult::REJECTED);
+  CHECK(c.close(c.findByEvent(5)->record_id));
+  CHECK(c.onAlert(makeAlert(999, AlertLevel::PRIORITY, enu(0, -90000), 70.0f, 0, t0), LinkType::LOS, t0) ==
+        gmcs::IngestResult::NEW_RECORD);
+  CHECK(c.findByEvent(5) == nullptr && c.findByEvent(999) != nullptr);
+}
+
+// A one-frame imaging detection (a glint, clutter) never reaches the pack; a
+// source the imager sees again does, and a confirmed source's later fixes go
+// out at once. In the Monte Carlo, single false fixes that DF bearings on a
+// beacon's frequency happened to cross near were the only false PRIORITYs.
+TEST(one_look_fixes_are_held_until_a_second_confirms) {
+  auto p = std::make_unique<Pack>(2);
+  p->place(0, 0, 0);
+  p->place(1, 0, 5000);
+  p->run(2000);
+  const std::uint32_t sent = p->mgr[0]->stats().observations_sent;
+
+  CHECK(p->mgr[0]->reportLocalDetection(fixObs(SensorType::IR, enu(2000, 1000), 60.0f)));  // one look: held
+  p->run(1000);
+  CHECK(p->mgr[0]->table().events().empty() && p->mgr[1]->table().events().empty());
+  CHECK(p->mgr[0]->stats().local_fixes_held == 1 && p->mgr[0]->stats().observations_sent == sent);
+
+  // A second look from another sensor or at another place does not confirm it.
+  CHECK(p->mgr[0]->reportLocalDetection(fixObs(SensorType::EO, enu(2000, 1000), 60.0f)));
+  CHECK(p->mgr[0]->reportLocalDetection(fixObs(SensorType::IR, enu(6000, 1000), 60.0f)));
+  p->run(1000);
+  CHECK(p->mgr[0]->table().events().empty() && p->mgr[0]->stats().local_fixes_held == 3);
+
+  // The same sensor sees it again, 40 m away: confirmed and shared.
+  CHECK(p->mgr[0]->reportLocalDetection(fixObs(SensorType::IR, enu(2040, 980), 60.0f)));
+  p->run(1000);
+  CHECK(p->mgr[0]->table().events().size() == 1 && p->mgr[1]->table().events().size() == 1);
+  CHECK(p->mgr[0]->stats().local_fixes_held == 3);
+
+  // Later looks at a confirmed source go out at once.
+  CHECK(p->mgr[0]->reportLocalDetection(fixObs(SensorType::IR, enu(2010, 1010), 60.0f)));
+  CHECK(p->mgr[0]->stats().local_fixes_held == 3);
+
+  // After a gap longer than the window the track has lapsed: one look is held again.
+  p->run(MeshConfig{}.fix_confirm_window_ms + 1000);
+  CHECK(p->mgr[0]->reportLocalDetection(fixObs(SensorType::IR, enu(2000, 1000), 60.0f)));
+  CHECK(p->mgr[0]->stats().local_fixes_held == 4);
+
+  // fix_confirm_count = 1 turns confirmation off.
+  MeshConfig one;
+  one.fix_confirm_count = 1;
+  auto q = std::make_unique<Pack>(2, one);
+  q->place(0, 0, 0);
+  q->place(1, 0, 5000);
+  q->run(2000);
+  CHECK(q->mgr[0]->reportLocalDetection(fixObs(SensorType::IR, enu(2000, 1000), 60.0f)));
+  q->run(1000);
+  CHECK(q->mgr[1]->table().events().size() == 1 && q->mgr[0]->stats().local_fixes_held == 0);
 }
 
 // ----------------------------------------------------------------------- main

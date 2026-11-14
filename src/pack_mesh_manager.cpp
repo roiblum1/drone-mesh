@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 
 #include "amc8270/mesh/geo.hpp"
 #include "amc8270/mesh/validation.hpp"
@@ -18,9 +19,16 @@ LinkType pickLink(LinkMask m) noexcept {
 
 }  // namespace
 
-PackMeshManager::PackMeshManager(DroneId self, const MeshConfig& cfg, IClock& clock, IMeshTransceiver& radio,
-                                 IGmcsLink& gmcs, IGuidanceSink& guidance) noexcept
-    : self_(self), cfg_(cfg), clock_(clock), radio_(radio), gmcs_(gmcs), guidance_(guidance), table_(self, cfg) {
+PackMeshManager::PackMeshManager(DroneId self, const MeshConfig& cfg, std::uint32_t boot_session, IClock& clock,
+                                 IMeshTransceiver& radio, IGmcsLink& gmcs, IGuidanceSink& guidance) noexcept
+    : self_(self),
+      cfg_(cfg),
+      clock_(clock),
+      radio_(radio),
+      gmcs_(gmcs),
+      guidance_(guidance),
+      security_(self, boot_session, cfg),
+      table_(self, cfg) {
   own_.id = self;
   // Seed event ids from boot time so ids handed out before a restart are not reused.
   table_.seedEventCounter(static_cast<std::uint16_t>((clock_.nowMs() / 1000U) & 0xFFFFU));
@@ -67,6 +75,10 @@ bool PackMeshManager::reportLocalDetection(SensorObservation obs) noexcept {
     ++stats_.local_rejected;
     return false;
   }
+  if (obs.has_fix && !confirmFix(obs)) {
+    ++stats_.local_fixes_held;
+    return true;  // accepted, held until a second look confirms it
+  }
   if (obs.event_hint == kNoEvent) {
     obs.event_hint = table_.associate(obs);
     if (obs.event_hint == kNoEvent) obs.event_hint = table_.allocateEventId();
@@ -76,6 +88,43 @@ bool PackMeshManager::reportLocalDetection(SensorObservation obs) noexcept {
   obs.event_hint = id;
   if (broadcast(ObservationPayload{obs}, now)) ++stats_.observations_sent;
   return true;
+}
+
+// M-of-N confirmation of this drone's own fixes (MeshConfig::fix_confirm_count).
+// A fix that agrees with an earlier one from the same sensor, within the
+// window, adds a look to that track; otherwise it starts a track, in a free
+// slot or the one heard from longest ago. True once the track has enough looks.
+bool PackMeshManager::confirmFix(const SensorObservation& obs) noexcept {
+  if (cfg_.fix_confirm_count <= 1) return true;
+  const TimeMs t = obs.timestamp_ms;
+  for (auto& tr : fix_tracks_) {
+    if (tr.looks != 0 && elapsedMs(t, tr.last_ms) > cfg_.fix_confirm_window_ms) tr.looks = 0;  // expired
+  }
+  FixTrack* match = nullptr;
+  double best = 0.0;
+  for (auto& tr : fix_tracks_) {
+    if (tr.looks == 0 || tr.sensor != obs.sensor) continue;
+    const double gate = cfg_.association_gate_m +
+                        cfg_.association_cep_factor * (static_cast<double>(tr.cep_m) + static_cast<double>(obs.fix_cep_m));
+    const double d = distanceM(tr.fix, obs.fix);
+    if (d <= gate && (match == nullptr || d < best)) {
+      match = &tr;
+      best = d;
+    }
+  }
+  if (match == nullptr) {
+    match = &fix_tracks_[0];
+    for (auto& tr : fix_tracks_) {  // a free slot, else the one heard from longest ago
+      if (match->looks == 0) break;
+      if (tr.looks == 0 || tr.last_ms < match->last_ms) match = &tr;
+    }
+    *match = FixTrack{obs.sensor, obs.fix, obs.fix_cep_m, t, 0};
+  }
+  match->fix = obs.fix;
+  match->cep_m = obs.fix_cep_m;
+  match->last_ms = std::max(match->last_ms, t);
+  if (match->looks < 255) ++match->looks;
+  return match->looks >= cfg_.fix_confirm_count;
 }
 
 void PackMeshManager::applyGmcsDismissal(std::uint32_t signature) noexcept {
@@ -88,6 +137,22 @@ void PackMeshManager::addKnownBenignSignature(std::uint32_t signature) noexcept 
   (void)table_.markBenign(signature, false);  // false just means it was already known
 }
 
+bool PackMeshManager::installEpochKey(std::uint16_t epoch, const crypto::Key& key, TimeMs valid_from_ms,
+                                      TimeMs valid_until_ms) noexcept {
+  return security_.installEpochKey(epoch, key, valid_from_ms, valid_until_ms);
+}
+
+bool PackMeshManager::eraseEpochKey(std::uint16_t epoch) noexcept { return security_.eraseEpochKey(epoch); }
+
+void PackMeshManager::zeroizeKeys() noexcept { security_.zeroizeAll(); }
+
+bool PackMeshManager::revokeDrone(DroneId id) noexcept {
+  if (!security_.revokeDrone(id)) return false;
+  if (table_.removePeer(id)) ++stats_.peers_lost;
+  (void)table_.purgeObserver(id);
+  return true;
+}
+
 void PackMeshManager::shutdown() noexcept {
   cancelTask(true);
   (void)broadcast(LeavePayload{}, clock_.nowMs());
@@ -98,13 +163,14 @@ void PackMeshManager::shutdown() noexcept {
 template <typename Payload>
 bool PackMeshManager::broadcast(const Payload& payload, TimeMs now) noexcept {
   MeshPacket p;
-  p.header.src = self_;
-  p.header.seq = ++seq_;
-  p.header.time_ms = now;
   p.payload = payload;
   std::array<std::uint8_t, kMaxPacketBytes> buf;
-  const std::size_t n = encodePacket(p, buf.data(), buf.size());
-  if (n == 0 || !radio_.send(buf.data(), n)) return false;
+  const std::size_t n = security_.seal(p, now, buf.data(), buf.size());
+  if (n == 0) {
+    ++stats_.tx_no_key;  // the only way seal() fails for a well-formed payload
+    return false;
+  }
+  if (!radio_.send(buf.data(), n)) return false;
   ++stats_.tx_packets;
   return true;
 }
@@ -115,27 +181,47 @@ void PackMeshManager::receiveAll(TimeMs now) noexcept {
     const std::size_t n = radio_.receive(buf.data(), buf.size());
     if (n == 0) break;
     MeshPacket pkt;
-    if (!decodePacket(buf.data(), n, pkt)) {
-      ++stats_.rx_rejected;
-      continue;
+    switch (security_.open(buf.data(), n, now, pkt)) {
+      case OpenStatus::OK:
+        ++stats_.rx_packets;
+        handlePacket(pkt, now);
+        break;
+      case OpenStatus::LOOPBACK:
+        break;
+      case OpenStatus::MALFORMED:
+        ++stats_.rx_rejected;
+        break;
+      case OpenStatus::NO_KEY:
+        ++stats_.rx_no_key;
+        break;
+      case OpenStatus::AUTH_FAILED:
+        ++stats_.rx_auth_failed;
+        break;
+      case OpenStatus::REVOKED:
+        ++stats_.rx_revoked;
+        break;
+      case OpenStatus::STALE:
+        ++stats_.rx_stale;
+        break;
+      case OpenStatus::REPLAYED:
+        ++stats_.rx_replayed;
+        break;
     }
-    ++stats_.rx_packets;
-    handlePacket(pkt, now);
   }
 }
 
 void PackMeshManager::handlePacket(const MeshPacket& pkt, TimeMs now) noexcept {
-  if (pkt.header.src == self_) return;  // multicast loopback
+  if (pkt.header.src == self_) return;  // multicast loopback (already filtered by the security layer)
 
   if (const auto* hb = std::get_if<HeartbeatPayload>(&pkt.payload)) {
-    if (table_.updatePeer(hb->state, pkt.header.seq, now)) ++stats_.peers_discovered;
+    if (table_.updatePeer(hb->state, pkt.header.session, pkt.header.seq, now)) ++stats_.peers_discovered;
     return;
   }
-  table_.notePacket(pkt.header.src, pkt.header.seq, now);
+  table_.notePacket(pkt.header.src, pkt.header.session, pkt.header.seq, now);
 
   // A drone only speaks for itself: it relays nothing, so the named observer,
-  // claimant or issuer must be the sender. (Without message authentication
-  // this stops accidents and naive spoofing, not a determined attacker.)
+  // claimant or issuer must be the sender. The sender itself is authenticated:
+  // the frame verified under that drone's own key for the epoch.
   if (const auto* ob = std::get_if<ObservationPayload>(&pkt.payload)) {
     if (ob->obs.observer != pkt.header.src) {
       ++stats_.rx_rejected;
@@ -203,6 +289,14 @@ void PackMeshManager::sendAntiEntropy(TimeMs now) noexcept {
   for (std::size_t i = 0; i < table_.learnedCount(); ++i) {
     (void)broadcast(SignatureUpdatePayload{table_.learnedAt(i)}, now);
   }
+
+  for (std::size_t i = issued_.size(); i-- > 0;) {
+    if (elapsedMs(now, issued_[i].at_ms) > cfg_.alert_notice_repeat_ms) {
+      issued_.erase_at(i);
+      continue;
+    }
+    (void)broadcast(AlertIssuedPayload{table_.resolve(issued_[i].event), issued_[i].level, self_}, now);
+  }
 }
 
 // ----------------------------------------------------------------- tick
@@ -259,6 +353,7 @@ void PackMeshManager::cancelTask(bool notify_guidance) noexcept {
 void PackMeshManager::syncOwnTask(const Assignment* mine, TimeMs now) noexcept {
   if (mine == nullptr) {
     cancelTask(true);
+    pending_event_ = kNoEvent;
     return;
   }
 
@@ -272,26 +367,57 @@ void PackMeshManager::syncOwnTask(const Assignment* mine, TimeMs now) noexcept {
   t.sensor_to_cue = mine->sensor_to_cue;
   t.urgency = mine->urgency;
 
-  bool issue = !task_active_;
-  if (task_active_) {
+  // A new assignment (or a different event or role) is claimed at once but flown
+  // only once it has held for claim_confirm_ms.
+  bool claim_now = false;
+  const auto confirmNew = [&]() {
+    const bool same = pending_event_ != kNoEvent && table_.resolve(pending_event_) == mine->event_id &&
+                      pending_role_ == mine->role;
+    if (!same) {
+      pending_role_ = mine->role;
+      pending_since_ms_ = now;
+      claim_now = true;
+    }
+    pending_event_ = mine->event_id;  // adopt a renamed id
+    return isDue(now, pending_since_ms_, cfg_.claim_confirm_ms);
+  };
+
+  bool issue = false;
+  if (!task_active_) {
+    issue = confirmNew();
+  } else {
     if (table_.resolve(task_.event_id) != mine->event_id || task_.role != mine->role) {
-      issue = true;
+      issue = confirmNew();
     } else {
+      pending_event_ = kNoEvent;
       task_.event_id = mine->event_id;  // adopt a renamed id
-      const double threshold =
-          std::max(cfg_.retask_move_m, cfg_.retask_cep_factor * static_cast<double>(task_.target_cep_m));
-      if (distanceM(task_.target, t.target) > threshold) issue = true;
+      const double cep_then = static_cast<double>(task_.target_cep_m);
+      const double cep_now = static_cast<double>(t.target_cep_m);
+      const double moved = distanceM(task_.target, t.target);
+      const bool beyond_noise = moved > std::max(cfg_.retask_move_m, cfg_.retask_cep_factor * std::hypot(cep_then, cep_now));
+      const bool refined = cep_now <= 0.5 * cep_then && moved > std::max(cfg_.retask_move_m, cfg_.retask_cep_factor * cep_now);
+      // A momentarily lost fix (a provisional point down one bearing) never re-points a verifier
+      // already flying to a real position estimate.
+      const bool lost_fix = cep_now >= cfg_.provisional_cep_m && cep_then < cfg_.provisional_cep_m;
+      if ((beyond_noise || refined) && !lost_fix) {
+        if (retask_pending_since_ms_ == 0) retask_pending_since_ms_ = now;
+        issue = isDue(now, retask_pending_since_ms_, cfg_.retask_confirm_ms);  // only once the move persists
+      } else {
+        retask_pending_since_ms_ = 0;
+      }
     }
   }
 
   if (issue) {
+    retask_pending_since_ms_ = 0;
+    pending_event_ = kNoEvent;
     guidance_.requestVerification(t);
     task_ = t;
     task_active_ = true;
     ++stats_.tasks_issued;
     heartbeat_requested_ = true;
     table_.setSelf(exportedState());
-  } else if (!isDue(now, last_claim_ms_, 2ULL * static_cast<TimeMs>(cfg_.anti_entropy_period_ms))) {
+  } else if (!claim_now && !isDue(now, last_claim_ms_, 2ULL * static_cast<TimeMs>(cfg_.anti_entropy_period_ms))) {
     return;
   }
 
@@ -308,7 +434,7 @@ void PackMeshManager::dispatchAlerts(TimeMs now) noexcept {
 
   for (std::size_t k = 0; k < n; ++k) {
     DetectedEvent& ev = events[order[k]];
-    const AlertLevel level = evaluateAlertLevel(ev, table_.isBenign(ev.signature), cfg_);
+    const AlertLevel level = evaluateAlertLevel(ev, table_.isBenign(ev.signature), cfg_, &table_);
     if (level != AlertLevel::PRIORITY) ev.priority_ready_ms = 0;
     if (level == AlertLevel::NONE) {
       ev.advisory_ready_ms = 0;
@@ -320,9 +446,17 @@ void PackMeshManager::dispatchAlerts(TimeMs now) noexcept {
     TimeMs& ready = level == AlertLevel::PRIORITY ? ev.priority_ready_ms : ev.advisory_ready_ms;
     if (ready == 0) ready = now;
 
+    // A position from bearings alone must hold before it warns anyone; the
+    // backup ranks then count from the end of that hold, as they would otherwise.
+    TimeMs hold = 0;
+    if (level == AlertLevel::ADVISORY) {
+      bool fix = false;
+      for (const auto& o : ev.observations) fix = fix || o.has_fix;
+      if (!fix) hold = cfg_.advisory_bearing_hold_ms;
+    }
     const int rank = alertOwnerRank(table_, ev, self_);
     if (rank < 0) continue;
-    if (elapsedMs(now, ready) < static_cast<TimeMs>(rank) * cfg_.alert_backup_delay_ms) continue;
+    if (elapsedMs(now, ready) < hold + static_cast<TimeMs>(rank) * cfg_.alert_backup_delay_ms) continue;
 
     GmcsAlert alert;
     alert.event_id = ev.id;
@@ -335,6 +469,8 @@ void PackMeshManager::dispatchAlerts(TimeMs now) noexcept {
     alert.observer_count = ev.observer_count;
     alert.issuer = self_;
     alert.primary_verifier = ev.verifier[0].id;
+    alert.signature = ev.signature;
+    alert.first_seen_ms = ev.first_seen_ms;
     alert.timestamp_ms = now;
 
     if (!gmcs_.sendAlert(alert, pickLink(own_.available_links))) {
@@ -342,7 +478,9 @@ void PackMeshManager::dispatchAlerts(TimeMs now) noexcept {
       continue;
     }
     table_.markAlertSent(ev.id, level);
-    (void)broadcast(AlertIssuedPayload{ev.id, level, self_}, now);  // peers' backup delay covers a lost copy
+    (void)broadcast(AlertIssuedPayload{ev.id, level, self_}, now);
+    if (issued_.full()) issued_.erase_at(0);
+    (void)issued_.push_back(IssuedAlert{ev.id, level, now});  // repeated by anti-entropy (cannot fail: made room)
     if (level == AlertLevel::PRIORITY) {
       ++stats_.priority_alerts_sent;
     } else {
