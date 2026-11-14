@@ -62,7 +62,7 @@ The seed corpus (`fuzz/corpus`, written by `fuzz/make_corpus.cpp`) holds one rec
 | `mesh_security.hpp/.cpp` | `MeshSecurity`: seals and opens frames; key epochs, per-drone keys, replay windows, freshness, revocation |
 | `crypto.hpp/.cpp` | ChaCha20-Poly1305 (RFC 8439), constant-time tag check, key zeroization |
 | `geo.hpp/.cpp` | Distance and bearing, local east/north frame, bearing-only triangulation |
-| `situational_awareness.hpp/.cpp` | `SituationalAwarenessTable`: peers, fused events, verifier slots, and the common learning of the situation (benign signatures) |
+| `situational_awareness.hpp/.cpp` | `SituationalAwarenessTable`: peers, fused events, verifier slots, the common learning of the situation (benign signatures), and the deterministic re-clustering |
 | `coordination.hpp/.cpp` | Mission task prioritisation: urgency, suitability, verifier selection, alert levels and alert-owner ranking (pure functions) |
 | `pack_mesh_manager.hpp/.cpp` | `PackMeshManager`: discovery, state sync, `evaluateAndCoordinateAlerts()` |
 | `hal.hpp` | Interfaces to the Mesh Network Transceiver, clock, C2 link and FCS, so the logic runs on any RTOS, a host, or the simulator |
@@ -70,7 +70,7 @@ The seed corpus (`fuzz/corpus`, written by `fuzz/make_corpus.cpp`) holds one rec
 ### Pack independence: how a pack decides with no leader
 
 1. Each drone broadcasts a heartbeat (1 Hz) with its position, fuel, active sensor and mode, and each sensor reading as it happens.
-2. Every drone folds the same readings into the same table. Readings are keyed by (observer, sensor) and kept in sorted order, so tables converge. Own readings are re-sent every 2 s, so a lost packet only delays convergence.
+2. Every drone folds the same readings into the same table. Own readings are re-sent every 2 s, so a lost packet only delays convergence. On every refresh the table re-clusters all its readings from scratch in a canonical order (fixes first, then bearings one frequency at a time), so which readings form an event, and the event's id, depend only on the set of readings: not on the order they arrived in, and not on which drone holds them. An event's id is the lowest id its readings carry, so ids converge across the pack; every id that moves keeps an alias.
 3. `evaluateAndCoordinateAlerts()` runs every 0.5 s on every drone: fuse bearings into positions, merge duplicate events, rank by urgency (mission task prioritisation), and compute the verifier plan. The plan is a deterministic function of the table, so drones with the same table agree without negotiating.
 4. A drone that finds itself in the plan sends a request to the FCS (standoff point, approach bearing, sensor to cue) and claims its slot on the mesh. Claims are arbitrated by score (quantised, so every drone ends with the same holder whatever the arrival order), ties by lowest id. A drone that loses arbitration is not ordered off its task; it gives way at the next plan, because the winner now holds the incumbent bonus.
 5. Alerts to the GMCS: ADVISORY once an event is localised well enough, PRIORITY once two sensor types agree. One drone is the owner, with ranked backups; the GMCS also de-duplicates by event id.
@@ -83,7 +83,7 @@ The seed corpus (`fuzz/corpus`, written by `fuzz/make_corpus.cpp`) holds one rec
 - Explicit little-endian serialisation; no struct copies onto the wire.
 - `make audit` fails the build if the library uses `new`, `malloc`, `throw`, `dynamic_cast`, `std::vector`, `std::string` and similar.
 
-One `PackMeshManager` is about 63 KB of fixed storage.
+One `PackMeshManager` is about 128 KB of fixed storage. Half of that is a second event list the re-clustering builds into. A refresh takes 0.1 to 1.5 ms for realistic tables on a desktop core, and 8.5 ms in the worst case measured: a full table of 512 bearings on one frequency.
 
 ### Mesh security
 
@@ -124,9 +124,9 @@ These are the open items you should know about before relying on any of this:
 - **The FCS interface has no reply.** A real one needs accept / refuse.
 - **Time assumes a shared GNSS-disciplined clock.** GNSS-denied operation is not handled.
 - **The corridor is a circle.** A real approved corridor is a polygon.
-- **Mesh partitions** are handled by design (each side keeps working, the GMCS de-duplicates) but not tested.
 - **A pack member can still lie in its own name.** Authentication proves which drone sent a frame, not that its content is true. A drone that holds a valid key can report false readings or send a `SIGNATURE_UPDATE` that dismisses a frequency pack-wide. Content checks limit the damage (ranges, a drone speaks only for itself); revocation removes the drone.
-- **Association depends on arrival order in one corner case.** Three sources closer together than the association gate (500 m plus 1.5 x CEP) can be grouped differently depending on which reading arrives first, and the grouping is not revisited. A deterministic re-clustering in `refresh()` would fix it.
+- **A partition doubles the alerts.** Each side of a split mesh localises the source under its own id and alerts the GMCS. After the heal the pack converges on one event and does not alert again (tested), but the GMCS has two records to fold into one.
+- **Re-clustering is greedy, not optimal.** It is deterministic and does not fragment a source under bearing noise, but it is not a global assignment. Two sources on one frequency, seen only by bearings, at an awkward geometry can still be grouped wrongly until a fix or more geometry arrives, and every drone then makes the same mistake.
 - **Bearing-only readings with no signature are never triangulated.** Readings are linked by frequency until a position exists. Every RF direction-finder reports a frequency, so this only matters for a sensor that does not.
 - **Plans assume nearly synchronous state.** Each drone plans from its own fresh state, its peers' last heartbeats (up to 1 s old) and its own clock. Claims and the incumbent bonus absorb the small differences; large clock disagreement is not handled.
 

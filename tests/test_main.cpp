@@ -1691,6 +1691,255 @@ TEST(config_validation) {
   CHECK(!isValid(c));
 }
 
+// ------------------------------------ deterministic re-clustering, partitions
+
+// A table's partition as text: one line per event, "id: observer/sensor@t ...", events by id.
+static void describePartition(const SituationalAwarenessTable& t, char* out, std::size_t cap) {
+  std::array<std::size_t, kMaxEvents> idx{};
+  const auto& events = t.events();
+  for (std::size_t i = 0; i < events.size(); ++i) idx[i] = i;
+  std::sort(idx.begin(), idx.begin() + static_cast<std::ptrdiff_t>(events.size()),
+            [&](std::size_t a, std::size_t b) { return events[a].id < events[b].id; });
+  std::size_t n = 0;
+  out[0] = '\0';
+  for (std::size_t k = 0; k < events.size(); ++k) {
+    const DetectedEvent& ev = events[idx[k]];
+    n += static_cast<std::size_t>(std::snprintf(out + n, cap - n, "%08X:", ev.id));
+    for (const auto& o : ev.observations) {
+      n += static_cast<std::size_t>(std::snprintf(out + n, cap - n, " %u/%u@%llu", o.observer,
+                                                  static_cast<unsigned>(o.sensor),
+                                                  static_cast<unsigned long long>(o.timestamp_ms % 100000)));
+    }
+    n += static_cast<std::size_t>(std::snprintf(out + n, cap - n, "\n"));
+    if (n >= cap) break;
+  }
+}
+
+TEST(reclustering_does_not_depend_on_arrival_order) {
+  // The corner case the README listed: three sources in a row 440 m apart, so
+  // that A-B and B-C pass the association gate but A-C does not. Greedy
+  // association grouped them three different ways depending only on which
+  // reading came first (found by searching spacings with re-clustering off).
+  // Each source is seen by two imagers; every reading carries its observer's id.
+  const TimeMs now = 1'700'000'000'000ULL;
+  std::array<SensorObservation, 6> obs{};
+  const double xs[3] = {0.0, 440.0, 880.0};
+  for (std::size_t s = 0; s < 3; ++s) {
+    for (std::size_t k = 0; k < 2; ++k) {
+      SensorObservation o =
+          fixObs(k == 0 ? SensorType::IR : SensorType::EO, enu(20000.0 + xs[s] + (k == 0 ? -30.0 : 30.0), 5000.0), 60.0f);
+      const auto observer = static_cast<DroneId>(2 + s * 2 + k);
+      obs[s * 2 + k] = tableObs(o, observer, now - 100 * (s * 2 + k), (static_cast<EventId>(observer) << 16U) | 1U);
+    }
+  }
+  std::array<std::size_t, 6> order = {0, 1, 2, 3, 4, 5};
+  std::array<char, 2048> first{};
+  std::array<char, 2048> desc{};
+  int permutations = 0;
+  int differ = 0;
+  do {
+    MeshConfig cfg;
+    auto t = std::make_unique<SituationalAwarenessTable>(1, cfg);
+    for (std::size_t i : order) (void)t->ingestObservation(obs[i], now);
+    t->refresh(now);
+    describePartition(*t, desc.data(), desc.size());
+    if (permutations == 0) first = desc;
+    if (std::strcmp(first.data(), desc.data()) != 0) ++differ;
+    ++permutations;
+  } while (std::next_permutation(order.begin(), order.end()));
+  CHECK(permutations == 720);
+  CHECK(differ == 0);
+  if (differ != 0) std::printf("    first:\n%s    last:\n%s", first.data(), desc.data());
+}
+
+TEST(reclustering_ids_follow_the_readings_not_the_drone) {
+  // Two drones that file the same readings in different orders, under
+  // different local ids, end with the same events under the same ids.
+  const TimeMs now = 1'700'000'000'000ULL;
+  MeshConfig cfg;
+  auto a = std::make_unique<SituationalAwarenessTable>(1, cfg);
+  auto b = std::make_unique<SituationalAwarenessTable>(9, cfg);
+  std::array<SensorObservation, 5> obs{};
+  for (std::size_t k = 0; k < 4; ++k) {
+    SensorObservation o = bearingObs(enu(0, -9000.0 + 6000.0 * k), enu(12000, 3000));
+    o.observer_position = enu(0, -9000.0 + 6000.0 * k);
+    const auto observer = static_cast<DroneId>(2 + k);
+    obs[k] = tableObs(o, observer, now - 50 * k, (static_cast<EventId>(observer) << 16U) | 3U);
+  }
+  obs[4] = tableObs(fixObs(SensorType::IR, enu(12040, 2980), 60.0f), 6, now, 0x00060003u);
+  for (std::size_t k = 0; k < obs.size(); ++k) (void)a->ingestObservation(obs[k], now);
+  for (std::size_t k = obs.size(); k-- > 0;) (void)b->ingestObservation(obs[k], now);
+  a->refresh(now);
+  b->refresh(now);
+  std::array<char, 2048> da{};
+  std::array<char, 2048> db{};
+  describePartition(*a, da.data(), da.size());
+  describePartition(*b, db.data(), db.size());
+  CHECK(std::strcmp(da.data(), db.data()) == 0);
+  CHECK(a->events().size() == 1 && b->events().size() == 1);
+  if (a->events().size() == 1) CHECK(a->events()[0].id == 0x00020003u);  // the lowest id its readings carry
+}
+
+TEST(a_split_event_keeps_its_alerts_with_one_heir) {
+  // A table that grouped two separate sources into one event (as arrival order
+  // once could) is split by the refresh; the event's history goes to one heir.
+  const TimeMs now = 1'700'000'000'000ULL;
+  MeshConfig cfg;
+  auto t = std::make_unique<SituationalAwarenessTable>(1, cfg);
+  const EventId id = t->ingestObservation(tableObs(fixObs(SensorType::IR, enu(30000, 0), 60.0f), 2, now, 0x00020001u), now);
+  CHECK(id == 0x00020001u);
+  DetectedEvent* ev = t->findEvent(id);
+  CHECK(ev != nullptr);
+  if (ev == nullptr) return;
+  // Force a second, far-away reading into the same event, as a stale greedy grouping would have.
+  CHECK(ev->observations.push_back(tableObs(fixObs(SensorType::EO, enu(30000, 9000), 60.0f), 3, now, 0x00030001u)));
+  ev->advisory_sent = true;
+  t->refresh(now);
+  CHECK(t->events().size() == 2);
+  int with_flag = 0;
+  for (const auto& e : t->events()) with_flag += e.advisory_sent ? 1 : 0;
+  CHECK(with_flag == 1);
+  const DetectedEvent* heir = t->findEvent(0x00020001u);
+  CHECK(heir != nullptr && heir->advisory_sent);
+  CHECK(t->findEvent(0x00030001u) != nullptr);
+}
+
+TEST(one_drone_hearing_two_sources_on_one_frequency_keeps_both) {
+  // One DF hears two beacons on 406.025 MHz at very different bearings before
+  // either is localised. Readings are keyed by (observer, sensor), so the
+  // second must not overwrite the first.
+  const TimeMs now = 1'700'000'000'000ULL;
+  MeshConfig cfg;
+  auto t = std::make_unique<SituationalAwarenessTable>(1, cfg);
+  SensorObservation north = bearingObs(enu(0, 0), enu(2000, 20000));
+  north.observer_position = enu(0, 0);
+  SensorObservation south = bearingObs(enu(0, 0), enu(3000, -20000));
+  south.observer_position = enu(0, 0);
+  const EventId a = t->ingestObservation(tableObs(north, 2, now, 0x00020001u), now);
+  const EventId b = t->ingestObservation(tableObs(south, 2, now + 10, 0x00020002u), now + 10);
+  CHECK(a != kNoEvent && b != kNoEvent && a != b);
+  t->refresh(now + 10);
+  CHECK(t->events().size() == 2);
+  // A later reading of the northern beacon still updates its own event.
+  SensorObservation north2 = north;
+  north2.bearing_deg += 0.5f;
+  CHECK(t->ingestObservation(tableObs(north2, 2, now + 2000, 0x00020001u), now + 2000) == a);
+  t->refresh(now + 2000);
+  CHECK(t->events().size() == 2);
+}
+
+// Six drones in two groups of three, 6 km apart in each group; both groups can hear the beacon.
+static void placeTwoGroups(Pack& p) {
+  for (std::size_t i = 0; i < 6; ++i) p.place(i, 0, -15000.0 + 6000.0 * static_cast<double>(i));
+}
+
+static std::size_t verifyingCount(const Pack& p) {
+  std::size_t n = 0;
+  for (std::size_t i = 0; i < p.n; ++i) n += p.mgr[i]->isVerifying() ? 1 : 0;
+  return n;
+}
+
+TEST(partition_then_heal_converges_to_one_event) {
+  auto p = std::make_unique<Pack>(6);
+  placeTwoGroups(*p);
+  p->run(2000);
+  for (std::size_t i = 3; i < 6; ++i) p->bus.group[i] = 1;  // split the mesh: {1,2,3} | {4,5,6}
+  p->run(6000);                                            // each side times the other out
+  CHECK(p->mgr[0]->table().peerCount() == 2 && p->mgr[3]->table().peerCount() == 2);
+  reportBeacon(*p, {0, 1, 2, 3, 4, 5});
+  p->run(5000);
+  // Each side localised the beacon under its own id and warned the GMCS.
+  const EventId id_a = soleEvent(*p->mgr[0]) != nullptr ? soleEvent(*p->mgr[0])->id : kNoEvent;
+  const EventId id_b = soleEvent(*p->mgr[3]) != nullptr ? soleEvent(*p->mgr[3])->id : kNoEvent;
+  CHECK(id_a != kNoEvent && id_b != kNoEvent && id_a != id_b);
+  CHECK(p->totalAlerts(AlertLevel::ADVISORY) == 2);  // one per side: the GMCS must de-duplicate
+  CHECK(verifyingCount(*p) <= 4);
+
+  for (auto& g : p->bus.group) g = 0;  // heal
+  p->run(8000);
+  const DetectedEvent* ref = soleEvent(*p->mgr[0]);
+  CHECK(ref != nullptr);
+  if (ref == nullptr) return;
+  CHECK(ref->id == (id_a < id_b ? id_a : id_b));
+  CHECK(ref->observations.size() == 6);
+  for (std::size_t i = 0; i < 6; ++i) {
+    const DetectedEvent* ev = soleEvent(*p->mgr[i]);
+    CHECK(ev != nullptr);
+    if (ev == nullptr) continue;
+    CHECK(ev->id == ref->id);
+    CHECK(ev->verifier[0].id == ref->verifier[0].id && ev->verifier[1].id == ref->verifier[1].id);
+    CHECK(p->mgr[i]->table().peerCount() == 5);
+    // Each side's old id still resolves there, so a late claim or alert notice quoting it lands.
+    CHECK(p->mgr[i]->table().resolve(i < 3 ? id_a : id_b) == ref->id);
+  }
+  CHECK(verifyingCount(*p) <= 2);  // the merged plan sends at most two
+  CHECK(p->totalAlerts(AlertLevel::ADVISORY) == 2);  // and nobody warns again
+
+  // Confirmation after the heal produces exactly one PRIORITY.
+  const GeoPoint truth = enu(kTruthE, kTruthN);
+  CHECK(p->mgr[1]->reportLocalDetection(fixObs(SensorType::IR, truth, 60.0f)));
+  CHECK(p->mgr[4]->reportLocalDetection(fixObs(SensorType::EO, enu(kTruthE - 30.0, kTruthN + 20.0), 60.0f)));
+  p->run(10000);
+  CHECK(p->totalAlerts(AlertLevel::PRIORITY) == 1);
+}
+
+TEST(partition_during_verification_reconciles_tasks) {
+  auto p = std::make_unique<Pack>(6);
+  placeTwoGroups(*p);
+  p->run(2000);
+  reportBeacon(*p, {0, 1, 2, 3, 4, 5});
+  p->run(4000);
+  const std::size_t before = verifyingCount(*p);
+  CHECK(before >= 1 && before <= 2);
+
+  for (std::size_t i = 3; i < 6; ++i) p->bus.group[i] = 1;
+  p->run(9000);  // each side loses sight of the other's verifiers and plans on its own
+  CHECK(verifyingCount(*p) <= 4);
+
+  for (auto& g : p->bus.group) g = 0;
+  p->run(10000);
+  CHECK(verifyingCount(*p) >= 1 && verifyingCount(*p) <= 2);
+  const DetectedEvent* ref = soleEvent(*p->mgr[0]);
+  CHECK(ref != nullptr);
+  if (ref == nullptr) return;
+  for (std::size_t i = 0; i < 6; ++i) {
+    const DetectedEvent* ev = soleEvent(*p->mgr[i]);
+    CHECK(ev != nullptr && ev->id == ref->id && ev->verifier[0].id == ref->verifier[0].id &&
+          ev->verifier[1].id == ref->verifier[1].id);
+    // Every drone that is still verifying holds one of the agreed slots.
+    if (p->mgr[i]->isVerifying()) {
+      const auto self = static_cast<DroneId>(i + 1);
+      CHECK(ref->verifier[0].id == self || ref->verifier[1].id == self);
+    }
+  }
+}
+
+TEST(dismissal_during_partition_reaches_the_other_side_on_heal) {
+  auto p = std::make_unique<Pack>(6);
+  placeTwoGroups(*p);
+  p->run(2000);
+  const std::uint32_t kIsm = 433920;
+  const GeoPoint truth = enu(kTruthE, kTruthN);
+  for (std::size_t i = 0; i < 6; ++i) {
+    SensorObservation o = bearingObs(p->mgr[i]->exportedState().position, truth, 0.0, kIsm);
+    o.class_hint = EventClass::RF_EMITTER;
+    CHECK(p->mgr[i]->reportLocalDetection(o));
+  }
+  p->run(3000);
+  for (std::size_t i = 3; i < 6; ++i) p->bus.group[i] = 1;
+  p->run(1000);
+  p->mgr[0]->applyGmcsDismissal(kIsm);  // the operator's uplink reaches side A only
+  p->run(3000);
+  for (std::size_t i = 0; i < 3; ++i) CHECK(p->mgr[i]->table().isBenign(kIsm));
+  for (std::size_t i = 3; i < 6; ++i) CHECK(!p->mgr[i]->table().isBenign(kIsm));
+  for (auto& g : p->bus.group) g = 0;
+  p->run(5000);
+  for (std::size_t i = 0; i < 6; ++i) {
+    CHECK(p->mgr[i]->table().isBenign(kIsm));
+    CHECK(!p->mgr[i]->isVerifying());
+  }
+}
+
 // ----------------------------------------------------------------------- main
 int main() {
   int failed_tests = 0;

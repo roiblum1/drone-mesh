@@ -88,6 +88,7 @@ The pack keeps one shared table of what it has learned about the environment: wh
 - **Pre-briefed benign signatures** are loaded on every drone from mission data.
 - **Operator dismissals** are learned and shared: when the operator marks an emitter benign, the drone holding the GMCS link broadcasts a `SIGNATURE_UPDATE`. Every peer marks the signature benign, drops the event, and releases any drone verifying it. Learned signatures are re-broadcast every 2 s so a drone that missed the message, or joined late, catches up.
 - **Convergence** under loss: observations are re-sent every 2 s by the drone that made them. In a 30 %-loss test all five tables held the same event with the same four observations after 25 s.
+- **Same grouping everywhere.** Every refresh re-clusters all readings in a canonical order, so drones holding the same readings hold the same events under the same ids, whatever order the readings arrived in. A test feeds the same six readings in all 720 orders and gets one result; the previous greedy association produced three different groupings of the same readings.
 
 Result [simulated]: at t = 420 s the dismissal of the ISM emitter reached all live drones; the drone verifying it was released the next cycle.
 
@@ -182,7 +183,7 @@ Memory: one `PackMeshManager` is about 60 KB of fixed storage, allocated once. N
 | GMCS takes a drone into `ACTIVE_MISSION` | Mesh task cancelled at once; peers re-plan | Yes |
 | Low fuel | Excluded by the fuel rule; it still contributes readings | Yes |
 | Alert owner has no link, or the send fails | Retried each cycle; the next-ranked drone takes over after 3 s | Yes |
-| Mesh partition | Each side keeps working from its own table; both sides may alert for the same event; the GMCS de-duplicates by event id | By design; not tested |
+| Mesh partition | Each side keeps working from its own table and may alert under its own id. On heal the tables converge on the lowest id, the plans merge to at most two verifiers, losing verifiers are released, and nobody alerts again. A dismissal made on one side reaches the other on heal | Yes: split, alert, heal, confirm; split during verification; dismissal across a split |
 | Two sources on the same frequency | Fused only if their positions or bearings agree; a shared frequency alone is not enough | Yes |
 | Packet naming another drone as its source, future timestamp, absurd values | Rejected on receipt and counted, even when sealed by a key holder | Yes |
 | Forged frame from outside the pack | Fails authentication (ChaCha20-Poly1305, per-drone keys); counted in `rx_auth_failed` | Yes: an outsider's frames, dismissals and alert notices change nothing |
@@ -190,7 +191,9 @@ Memory: one `PackMeshManager` is about 60 KB of fixed storage, allocated once. N
 | Drone captured or compromised | The GMCS revokes it (its frames are refused and its readings forgotten), then re-keys without it | Revocation yes; re-key distribution is outside this repo |
 | Drone reboots | New boot session: its frames are accepted at once, and frames from its old session are refused | Yes |
 | Clock stepped backwards (GNSS correction) | Periodic messages keep flowing | Yes |
-| Same source filed under two ids | Merged into the lowest id; old id kept as an alias | Yes |
+| Same source filed under two ids | Re-clustering names it by the lowest id its readings carry; every old id kept as an alias | Yes |
+| Readings arrive in a different order on different drones | Re-clustered from scratch each refresh in a canonical order: the grouping and ids depend only on the readings | Yes: all 720 orders of six readings give one grouping |
+| One DF hears two sources on one frequency | A second reading from the same sensor that disagrees with the first starts a new event instead of overwriting it | Yes |
 | Table full | Lowest-urgency event without a verifier is evicted | Yes |
 | FCS refuses a task | Not modelled: the request interface returns nothing; a real interface needs an accept/reject reply | Open |
 | **Insider forgery within an epoch** | Symmetric keys: any member can forge another's frames until the next epoch. Needs per-sender signatures to close | **Open** |

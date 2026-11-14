@@ -3,6 +3,7 @@
 // holds one; anti-entropy re-broadcast makes the copies converge.
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 
@@ -72,8 +73,14 @@ class SituationalAwarenessTable {
   // canonical event id, or kNoEvent if it had to be dropped.
   [[nodiscard]] EventId ingestObservation(const SensorObservation& obs, TimeMs now) noexcept;
 
-  // Prune, re-fuse, merge duplicates, validate verifier slots, update status.
+  // Prune expired readings, re-cluster every reading deterministically (the
+  // grouping and the ids depend only on the set of readings, not on the order
+  // they arrived in or on which drone holds them), fuse, validate verifier
+  // slots, update status.
   void refresh(TimeMs now) noexcept;
+  // Times refresh() could not re-cluster (more sources than kMaxEvents) and
+  // fell back to merging the existing events.
+  std::uint32_t reclusterFallbacks() const noexcept { return recluster_fallbacks_; }
 
   // Forget everything `observer` reported and any slot it holds (revoked drone).
   // Events left with no readings are dropped at the next refresh().
@@ -104,6 +111,20 @@ class SituationalAwarenessTable {
     bool learned = false;
   };
 
+  struct ObsRef {
+    std::uint8_t ev = 0;  // index into events_
+    std::uint8_t ob = 0;  // index into its observations
+  };
+  struct HintVote {
+    EventId hint = kNoEvent;
+    std::uint8_t cluster = 0;
+    std::uint8_t count = 0;
+  };
+
+  [[nodiscard]] bool recluster() noexcept;
+  void assignClusterIds() noexcept;
+  void inheritMetadata(std::size_t n_refs) noexcept;
+  bool consistentWithOwnReading(const SensorObservation& o, const DetectedEvent& ev) const noexcept;
   void addAlias(EventId from, EventId to) noexcept;
   void rename(EventId from, EventId to) noexcept;
   bool shouldMerge(const DetectedEvent& a, const DetectedEvent& b) const noexcept;
@@ -122,7 +143,20 @@ class SituationalAwarenessTable {
   StaticVector<DetectedEvent, kMaxEvents> events_{};
   StaticVector<Alias, kMaxAliases> aliases_{};
   StaticVector<BenignSig, kMaxKnownSignatures> benign_{};
+
+  // Scratch for recluster(): the new event list is built here, then replaces events_.
+  static constexpr std::size_t kMaxReadings = kMaxEvents * kMaxObsPerEvent;
+  static constexpr std::uint8_t kNoCluster = 0xFF;
+  StaticVector<DetectedEvent, kMaxEvents> scratch_{};
+  std::array<ObsRef, kMaxReadings> refs_{};
+  std::array<std::uint8_t, kMaxReadings> cluster_of_{};  // cluster of refs_[k], by assignment
+  StaticVector<HintVote, kMaxReadings> votes_{};
+  std::array<EventId, kMaxEvents> new_ids_{};
+  std::array<std::uint8_t, kMaxEvents> heir_{};  // old event -> cluster that takes its history
+  std::uint32_t recluster_fallbacks_ = 0;
 };
+static_assert(kMaxEvents < 0xFF, "cluster indices are std::uint8_t with 0xFF meaning none");
+static_assert(kMaxObsPerEvent <= 0xFF, "vote counts are std::uint8_t");
 
 // Re-fuse one event from its observations (exposed for tests).
 void fuseEvent(DetectedEvent& ev, const MeshConfig& cfg) noexcept;
