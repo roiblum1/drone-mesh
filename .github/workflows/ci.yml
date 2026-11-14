@@ -61,11 +61,15 @@ jobs:
       - uses: actions/checkout@v4
       - name: Monte Carlo
         run: make mc TRIALS=20
-      - name: Keep the distributions
+      - name: Replay viewer from fresh traces
+        run: make replay
+      - name: Keep the distributions and the replay page
         uses: actions/upload-artifact@v4
         with:
           name: monte-carlo
-          path: build/mc-*.json
+          path: |
+            build/mc-*.json
+            docs/pack-mesh-replay.html
 
   fuzz:
     name: fuzz (libFuzzer + ASan + UBSan)

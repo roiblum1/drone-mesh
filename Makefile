@@ -3,6 +3,7 @@
 #   make sim     build + run the 6-drone storyline (sim/scenarios/storyline6.scn)
 #   make sim16   the 16-drone scenario;  make scenarios  every scenario file
 #   make mc      Monte Carlo over both (TRIALS=200, writes build/mc-*.json)
+#   make replay  traces of both + docs/pack-mesh-replay.html (the replay viewer)
 #   make check   tests + sim under ASan/UBSan
 #   make audit   grep the flight library for banned constructs
 #   make fuzz    libFuzzer + ASan/UBSan on the decoder and receive path (clang, FUZZ_SECONDS)
@@ -33,7 +34,7 @@ SAN_LIB_OBJS := $(patsubst src/%.cpp,$(SAN)/%.o,$(LIB_SRCS))
 CXXFLAGS     := $(STD) $(WARN) $(FLIGHT) $(INC) $(OPT)
 SAN_CXXFLAGS := $(STD) $(WARN) $(FLIGHT) $(INC) -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=undefined
 
-.PHONY: all test sim sim16 scenarios mc check audit fuzz fuzz-regress corpus clean
+.PHONY: all test sim sim16 scenarios mc replay check audit fuzz fuzz-regress corpus clean
 all: $(BUILD)/mesh_tests $(BUILD)/pack_sim
 
 $(BUILD)/%.o: src/%.cpp $(HDRS) | $(BUILD)
@@ -83,6 +84,11 @@ sim16: $(BUILD)/pack_sim
 
 scenarios: $(BUILD)/pack_sim
 	@for f in $(SCENARIOS); do ./$(BUILD)/pack_sim --quiet $$f | tail -n 1 | sed "s|^|$$f: |" || exit 1; done
+
+replay: $(BUILD)/pack_sim
+	./$(BUILD)/pack_sim --quiet --trace $(BUILD)/trace-pack16.json sim/scenarios/pack16.scn
+	./$(BUILD)/pack_sim --quiet --trace $(BUILD)/trace-storyline6.json sim/scenarios/storyline6.scn
+	python3 -I tools/build_replay.py docs/pack-mesh-replay.html $(BUILD)/trace-pack16.json $(BUILD)/trace-storyline6.json
 
 mc: $(BUILD)/pack_sim
 	./$(BUILD)/pack_sim sim/scenarios/storyline6.scn --mc $(TRIALS) --mc-json $(BUILD)/mc-storyline6.json

@@ -12,6 +12,7 @@ The GMCS can route the whole pack but can actively control only one drone in mis
 | 2. Baseline versus mesh-enabled operations | [`docs/02_pack_capability_overview.md`](docs/02_pack_capability_overview.md) |
 | 3. Hardware block diagram (Mermaid, ASCII, interface table) | [`docs/03_hardware_block_diagram.md`](docs/03_hardware_block_diagram.md) |
 | 4. Embedded C++17 for the 8270 mesh | [`include/amc8270/mesh/`](include/amc8270/mesh), [`src/`](src), [`tests/`](tests), [`sim/`](sim) |
+| Animated replay of the simulated pack, for sharing | [`docs/pack-mesh-replay.html`](docs/pack-mesh-replay.html), built by `make replay` |
 | One-page overview for sharing | [`docs/pack-mesh-overview.html`](docs/pack-mesh-overview.html), generated from the files above by `python3 -I tools/build_overview_page.py docs/pack-mesh-overview.html` |
 
 ## Build and run
@@ -61,6 +62,10 @@ What the models add over the original sim:
 - **Ground:** C2 latency per link type at the GMCS.
 
 `pack_sim <file> --mc N` runs N trials, reseeding every random process and moving each source by up to the scenario's jitter. It reports time to first alert, time to PRIORITY and PRIORITY error, each as p5, p50, p95 and max. It also reports false alerts, split by cause (clutter, or a real source mislocalised by multipath, from the sim's ground-truth label on every reading), duplicates, FCS requests, mesh load and the pass rate of every check. `--mc-json` writes the distributions. A run is a pure function of (scenario, seed); the Monte Carlo output does not depend on the thread count.
+
+### Replay viewer
+
+`make replay` runs both realistic scenarios with `--trace` and builds [`docs/pack-mesh-replay.html`](docs/pack-mesh-replay.html), a self-contained page that animates the pack. It shows mesh links, every DF bearing as it is reported (reflections are drawn dashed), the pack's own uncertainty discs coloured by status, verifier paths to their standoff points, the true sources, and each alert as it reaches the GMCS. A scrubber is marked with alerts, faults and operator actions, alongside the timeline log. It switches between the 16-drone pack and the 6-drone storyline, works in light and dark, and needs no server (`tools/build_replay.py` embeds the traces in `tools/replay_viewer_template.html`).
 
 ### What the realistic simulation found
 
