@@ -184,11 +184,13 @@ void fuseEvent(DetectedEvent& ev, const MeshConfig& cfg) noexcept {
   }
 
   TriangulationResult tri;
-  if (n_lines >= 2 && triangulate(lines.data(), n_lines, cfg.min_geometry_eigen, tri)) {
+  if (n_lines >= 2 && triangulate(lines.data(), n_lines, cfg.min_geometry_eigen, tri) &&
+      std::hypot(tri.position.e, tri.position.n) <= cfg.max_association_range_m) {  // inside the flat frame's range
     est[n_est++] = {tri.position, std::max(tri.cep_m, 10.0) / kCepPerSigma};
   }
 
   const float alt = alt_n > 0.0 ? static_cast<float>(alt_sum / alt_n) : 0.0f;
+  bool fused = false;
   if (n_est > 0) {
     double sw = 0.0;
     double se = 0.0;
@@ -199,16 +201,19 @@ void fuseEvent(DetectedEvent& ev, const MeshConfig& cfg) noexcept {
       se += w * est[i].p.e;
       sn += w * est[i].p.n;
     }
-    ev.position = frame.fromEnu(Vec2{se / sw, sn / sw}, alt);
-    ev.cep_m = static_cast<float>(kCepPerSigma / std::sqrt(sw));
-    ev.localized = true;
-  } else if (newest_bearing != nullptr) {
-    ev.position = destinationPoint(newest_bearing->observer_position, static_cast<double>(newest_bearing->bearing_deg),
-                                   cfg.provisional_range_m);
-    ev.cep_m = static_cast<float>(cfg.provisional_cep_m);
-    ev.localized = false;
-  } else {
-    ev.localized = false;
+    const GeoPoint p = frame.fromEnu(Vec2{se / sw, sn / sw}, alt);
+    if (isPlausible(p)) {  // readings too far apart for the flat frame give nothing on the earth
+      ev.position = p;
+      ev.cep_m = static_cast<float>(kCepPerSigma / std::sqrt(sw));
+      fused = true;
+    }
+  }
+  ev.localized = fused;
+  if (!fused) {
+    if (newest_bearing != nullptr) {
+      ev.position = destinationPoint(newest_bearing->observer_position,
+                                     static_cast<double>(newest_bearing->bearing_deg), cfg.provisional_range_m);
+    }
     ev.cep_m = static_cast<float>(cfg.provisional_cep_m);
   }
 
@@ -393,6 +398,8 @@ void SituationalAwarenessTable::rename(EventId from, EventId to) noexcept {
 bool SituationalAwarenessTable::gatePasses(const SensorObservation& o, const DetectedEvent& ev,
                                            double& metric) const noexcept {
   if (ev.signature != 0 && o.signature != 0 && ev.signature != o.signature) return false;
+  // Beyond pack scale nothing can be the same source, and the flat fusion frame would not hold.
+  if (distanceM(o.has_fix ? o.fix : o.observer_position, ev.position) > cfg_.max_association_range_m) return false;
   if (!ev.localized) {
     metric = kUngatedMetric;
     return ev.signature != 0 && ev.signature == o.signature;
@@ -496,8 +503,10 @@ bool SituationalAwarenessTable::shouldMerge(const DetectedEvent& a, const Detect
                         cfg_.association_cep_factor * (static_cast<double>(a.cep_m) + static_cast<double>(b.cep_m));
     return distanceM(a.position, b.position) <= gate;
   }
-  // At least one side has no position: only a shared signature can link them.
+  // At least one side has no position: only a shared signature can link them,
+  // and only at pack scale.
   if (a.signature == 0 || a.signature != b.signature) return false;
+  if (distanceM(a.position, b.position) > cfg_.max_association_range_m) return false;
   const DetectedEvent* loc = a.localized ? &a : (b.localized ? &b : nullptr);
   if (loc == nullptr) return true;  // two bearing-only events on one frequency: nothing separates them yet
   const DetectedEvent& other = loc == &a ? b : a;

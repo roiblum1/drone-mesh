@@ -37,6 +37,8 @@ jobs:
           diff run1.txt run2.txt
       - name: Flight-library audit
         run: make audit
+      - name: Fuzz corpus replay (ASan + UBSan, this compiler)
+        run: make CXX=${{ matrix.cxx }} fuzz-regress
 
   sanitizers:
     name: ASan + UBSan
@@ -45,6 +47,26 @@ jobs:
       - uses: actions/checkout@v4
       - name: Tests and simulation under sanitizers
         run: make CXX=clang++ check
+
+  fuzz:
+    name: fuzz (libFuzzer + ASan + UBSan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clang fuzzer runtime
+        run: |
+          ver=$(clang++ --version | sed -n 's/.*clang version \([0-9]*\).*/\1/p')
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq "libclang-rt-${ver}-dev" || true
+      - name: Fuzz the decoder and receive path for 120 s
+        run: make fuzz FUZZ_SECONDS=120
+      - name: Keep any crashing input
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: build-fuzz/artifacts/
+          if-no-files-found: ignore
 
   cmake:
     name: CMake build + ctest

@@ -52,7 +52,7 @@ bool isValid(const MeshConfig& c) noexcept {
                        c.hysteresis_bonus >= 0.0f &&
                        static_cast<double>(c.w_eta + c.w_sensor + c.w_fuel + c.w_diversity + c.hysteresis_bonus) <=
                            static_cast<double>(kMaxClaimScore);
-  const bool geometry = c.association_gate_m > 0.0 && c.min_geometry_eigen > 0.0 && c.min_bearing_sigma_deg > 0.0 &&
+  const bool geometry = c.association_gate_m > 0.0 && c.max_association_range_m > c.provisional_range_m && c.min_geometry_eigen > 0.0 && c.min_bearing_sigma_deg > 0.0 &&
                         c.standoff_m > 0.0 && c.max_detour_m > 0.0 && c.geofence_radius_m >= 0.0 &&
                         c.retask_move_m >= 0.0;
   return periods && divisors && fractions && weights && geometry;

@@ -51,6 +51,11 @@ struct MeshConfig {
   std::uint32_t key_epoch_grace_ms = 10000;
 
   // ---- association and fusion
+  // Fusion works in a flat local frame, which holds at pack scale. A reading
+  // from further than this from an event (observer for a bearing, fix for a
+  // fix) is never associated with it, and no fused position further than
+  // this from its readings is reported.
+  double max_association_range_m = 100000.0;
   double association_gate_m = 500.0;
   double association_cep_factor = 1.5;
   double bearing_gate_deg = 2.0;       // added to 3*sigma when gating a bearing

@@ -27,6 +27,18 @@ make audit    # grep the flight library for banned constructs (new, throw, std::
 
 CMake works too: `cmake -S . -B build-cmake && cmake --build build-cmake && ctest --test-dir build-cmake`.
 
+### Fuzzing
+
+```
+make fuzz              # libFuzzer + ASan + UBSan, 60 s (FUZZ_SECONDS=...), needs clang
+make fuzz-regress      # replay fuzz/corpus through the same harness, any compiler
+make corpus            # regenerate the seed corpus
+```
+
+`fuzz/fuzz_packet.cpp` offers every input to the frame decoder as a raw datagram, which must never open, since nobody else holds its key. It then reads the input as a list of records and seals each one as a pack member would. Records are under the fuzzer's control: the sender, replays of earlier frames, reboots and clock steps. Each sealed frame goes through the security layer into a live `PackMeshManager`. The harness aborts if a decodable body does not re-encode to the same bytes, if a fresh frame is refused or a replayed one accepted, or if the manager's table is ever inconsistent: duplicate ids, unsorted readings, one drone in both slots, a fused value out of range. Random bytes almost never get past the tag, so sealing inside the harness is what lets the fuzzer reach fusion, planning and alerting.
+
+The seed corpus (`fuzz/corpus`, written by `fuzz/make_corpus.cpp`) holds one record of each type plus scenarios: triangulate, confirm, dismiss, two beacons on one frequency, and replay, reboot and leave. Inputs the fuzzer found are kept there as regression seeds (`regress-*`).
+
 ## Continuous integration
 
 `.github/workflows/ci.yml` runs on every push and pull request:
@@ -35,6 +47,7 @@ CMake works too: `cmake -S . -B build-cmake && cmake --build build-cmake && ctes
 |---|---|
 | build + test | `make test` and `make sim` with GCC and Clang (Ubuntu) and Apple Clang (macOS), plus a check that two simulation runs are byte-identical, plus `make audit` |
 | ASan + UBSan | Tests and simulation under AddressSanitizer and UndefinedBehaviorSanitizer |
+| fuzz | libFuzzer with ASan and UBSan on the decoder and receive path for 120 s; any crashing input is kept as an artifact. Every matrix build also replays the committed corpus |
 | CMake + ctest | The CMake build and its test registration |
 | clang-tidy + cppcheck | Static analysis of the flight library; any finding fails the build (rules in `.clang-tidy`) |
 

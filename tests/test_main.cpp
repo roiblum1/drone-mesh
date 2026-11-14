@@ -1470,6 +1470,33 @@ TEST(same_frequency_sources_far_apart_stay_separate) {
   CHECK(ic != kNoEvent && ic != ia);
 }
 
+TEST(readings_beyond_pack_scale_never_fuse) {
+  // Found by the fuzzer: two bearings on one frequency from observers 16,000 km
+  // apart joined one event, and the flat-frame fusion put it off the earth.
+  MeshConfig cfg;
+  SituationalAwarenessTable t(1, cfg);
+  const TimeMs now = 1'700'000'000'000ULL;
+  SensorObservation far_brg = bearingObs(GeoPoint{35.92, 162.48, 3000.0f}, GeoPoint{36.2, 162.48, 0.0f});
+  far_brg.observer_position = GeoPoint{35.92, 162.48, 3000.0f};
+  SensorObservation near_brg = bearingObs(enu(0, 0), enu(10000, 9000));
+  near_brg.observer_position = enu(0, 0);
+  const EventId a = t.ingestObservation(tableObs(far_brg, 2, now), now);
+  const EventId b = t.ingestObservation(tableObs(near_brg, 4, now), now);
+  CHECK(a != kNoEvent && b != kNoEvent && a != b);
+  t.refresh(now);
+  CHECK(t.events().size() == 2);  // not merged either
+  for (const auto& ev : t.events()) CHECK(isPlausible(ev.position));
+
+  // fuseEvent on its own never reports a fused position off the earth.
+  DetectedEvent ev;
+  ev.id = 1;
+  CHECK(ev.observations.push_back(tableObs(far_brg, 2, now)));
+  CHECK(ev.observations.push_back(tableObs(near_brg, 4, now)));
+  fuseEvent(ev, cfg);
+  CHECK(isPlausible(ev.position));
+  CHECK(!ev.localized);
+}
+
 TEST(rebooted_drone_never_reuses_an_event_id_in_use) {
   MeshConfig cfg;
   SituationalAwarenessTable t(1, cfg);
