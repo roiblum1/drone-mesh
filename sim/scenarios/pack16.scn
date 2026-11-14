@@ -2,7 +2,7 @@
 # under the realistic models of storyline6.scn plus single-sensor IR clutter.
 #
 #   beacon1, beacon2  two 406.025 MHz distress beacons (with a thermal source)
-#                     42 km apart: the same frequency must give two events
+#                     33 km apart: the same frequency must give two events
 #   fire              a thermal hazard with no RF emission: only an imager can
 #                     find it, when a drone passes within 3 km (drone 3, ~400 s)
 #   ism               a novel 433.92 MHz emitter, dismissed by the operator
@@ -69,7 +69,7 @@ mc trials 100 jitter_km 4 jitter_on_s 20
 
 # Gated checks are the ones the pack meets in (nearly) every Monte Carlo trial.
 # How quickly beacon1 and beacon2 are confirmed varies a lot with the draw
-# (clutter and reflections compete for verifiers): see `make mc` for that.
+# (reflections compete for verifiers): see `make mc` for that.
 expect advisory_within beacon1 30
 expect advisory_within fire 600
 expect priority_within fire 600

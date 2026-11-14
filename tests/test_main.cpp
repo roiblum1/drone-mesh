@@ -259,6 +259,12 @@ static SensorObservation fixObs(SensorType s, const GeoPoint& at, float cep, flo
   return o;
 }
 
+// An imager's fix reaches the pack once a second look confirms it
+// (MeshConfig::fix_confirm_count): report it as two agreeing looks.
+static bool reportFix(PackMeshManager& m, const SensorObservation& o) {
+  return m.reportLocalDetection(o) && m.reportLocalDetection(o);
+}
+
 // 5-drone line abreast, truth beacon east of the line (good crossing geometry).
 static const double kTruthE = 10000.0;
 static const double kTruthN = 2000.0;
@@ -660,8 +666,8 @@ TEST(advisory_then_priority_exactly_once) {
 
   // Two verifiers close in and add geolocated imaging fixes.
   const GeoPoint truth = enu(kTruthE + 80.0, kTruthN - 50.0);
-  CHECK(p->mgr[1]->reportLocalDetection(fixObs(SensorType::IR, truth, 60.0f, 0.8f)));
-  CHECK(p->mgr[3]->reportLocalDetection(fixObs(SensorType::IR, enu(kTruthE - 40.0, kTruthN + 30.0), 60.0f, 0.8f)));
+  CHECK(reportFix(*p->mgr[1], fixObs(SensorType::IR, truth, 60.0f, 0.8f)));
+  CHECK(reportFix(*p->mgr[3], fixObs(SensorType::IR, enu(kTruthE - 40.0, kTruthN + 30.0), 60.0f, 0.8f)));
   p->run(8000);
 
   CHECK(p->totalAlerts(AlertLevel::PRIORITY) == 1);
@@ -1405,7 +1411,7 @@ TEST(mesh_ignores_outsiders_replays_and_revoked_drones) {
   // Drone 3 reports a fix, then the GMCS revokes it: its readings are forgotten
   // and its frames refused.
   p->run(2000);
-  CHECK(p->mgr[2]->reportLocalDetection(fixObs(SensorType::IR, enu(9000, 0), 50.0f)));
+  CHECK(reportFix(*p->mgr[2], fixObs(SensorType::IR, enu(9000, 0), 50.0f)));
   p->run(1000);
   CHECK(p->mgr[0]->table().events().size() == 1);
   CHECK(p->mgr[0]->revokeDrone(3) && p->mgr[1]->revokeDrone(3));
@@ -1588,7 +1594,7 @@ TEST(anti_entropy_eventually_resends_every_reading) {
   p->run(2000);
   p->bus.isolated[1] = true;
   for (int k = 0; k < 24; ++k) {
-    CHECK(p->mgr[0]->reportLocalDetection(fixObs(SensorType::EO, enu(3000.0 * k, 40000.0), 50.0f, 0.7f)));
+    CHECK(reportFix(*p->mgr[0], fixObs(SensorType::EO, enu(3000.0 * k, 40000.0), 50.0f, 0.7f)));
   }
   p->bus.isolated[1] = false;
   p->run(8000);  // four anti-entropy cycles
@@ -1694,6 +1700,9 @@ TEST(config_validation) {
   c = MeshConfig{};
   c.peer_timeout_ms = c.heartbeat_period_ms;  // peers would time out between heartbeats
   CHECK(!isValid(c));
+  c = MeshConfig{};
+  c.fix_confirm_count = 0;  // 1 is the least: a fix confirms itself
+  CHECK(!isValid(c));
 }
 
 // ------------------------------------ deterministic re-clustering, partitions
@@ -1783,6 +1792,45 @@ TEST(reclustering_ids_follow_the_readings_not_the_drone) {
   CHECK(std::strcmp(da.data(), db.data()) == 0);
   CHECK(a->events().size() == 1 && b->events().size() == 1);
   if (a->events().size() == 1) CHECK(a->events()[0].id == 0x00020003u);  // the lowest id its readings carry
+}
+
+// The observer re-sends its readings under the id its own table now uses, so a
+// peer can hold one reading twice with different hints. It is still one
+// reading: counted twice, the copy stood alone as a phantom event with no
+// frequency, and bearings of any frequency passing near it joined it.
+TEST(one_reading_filed_under_two_ids_is_counted_once) {
+  const TimeMs now = 1'700'000'000'000ULL;
+  MeshConfig cfg;
+  auto t = std::make_unique<SituationalAwarenessTable>(1, cfg);
+  const GeoPoint src = enu(16000, 8000);
+  const SensorObservation fix = tableObs(fixObs(SensorType::IR, src, 70.0f), 4, now, 0x00040001u);
+  const EventId id = t->ingestObservation(fix, now);
+  for (DroneId k = 0; k < 3; ++k) {
+    const GeoPoint from = enu(0, -10000.0 + 10000.0 * k);
+    SensorObservation o = bearingObs(from, src);
+    o.observer_position = from;
+    (void)t->ingestObservation(tableObs(o, static_cast<DroneId>(5 + k), now, 0x00040001u), now);
+  }
+  // A bearing on another frequency that passes 300 m from the fix, filed on its own.
+  const GeoPoint other_from = enu(0, -30000);
+  SensorObservation other = bearingObs(other_from, enu(16000, 7700), 0.0, 433920);
+  other.observer_position = other_from;
+  const EventId o_id = t->ingestObservation(tableObs(other, 9, now, 0x00090001u), now);
+  CHECK(id != kNoEvent && o_id != kNoEvent && o_id != id);
+  // The same fix again, as re-sent under the id the observer's table moved it to.
+  DetectedEvent* host = t->findEvent(o_id);
+  CHECK(host != nullptr);
+  if (host == nullptr) return;
+  SensorObservation copy = fix;
+  copy.event_hint = 0x00040007u;
+  CHECK(host->observations.push_back(copy));
+  t->refresh(now);
+  int holders = 0;
+  for (const auto& ev : t->events()) {
+    for (const auto& o : ev.observations) holders += (o.observer == 4 && o.has_fix) ? 1 : 0;
+    CHECK(!(ev.signature == 433920 && ev.localized && distanceM(ev.position, src) < 1000.0));  // no ISM ghost on the fix
+  }
+  CHECK(holders == 1);
 }
 
 TEST(a_split_event_keeps_its_alerts_with_one_heir) {
@@ -1882,8 +1930,8 @@ TEST(partition_then_heal_converges_to_one_event) {
 
   // Confirmation after the heal produces exactly one PRIORITY.
   const GeoPoint truth = enu(kTruthE, kTruthN);
-  CHECK(p->mgr[1]->reportLocalDetection(fixObs(SensorType::IR, truth, 60.0f)));
-  CHECK(p->mgr[4]->reportLocalDetection(fixObs(SensorType::EO, enu(kTruthE - 30.0, kTruthN + 20.0), 60.0f)));
+  CHECK(reportFix(*p->mgr[1], fixObs(SensorType::IR, truth, 60.0f)));
+  CHECK(reportFix(*p->mgr[4], fixObs(SensorType::EO, enu(kTruthE - 30.0, kTruthN + 20.0), 60.0f)));
   p->run(10000);
   CHECK(p->totalAlerts(AlertLevel::PRIORITY) == 1);
 }
@@ -2092,6 +2140,68 @@ TEST(a_second_event_on_a_localised_frequency_waits_its_turn) {
   planAssignments(*t, drones, now, roomy, plan);
   CHECK(plan.size() >= 2);
   for (const auto& a : plan) CHECK(a.event_id != small->id);
+
+}
+
+// Two bearings always cross somewhere. On a frequency the pack has localised
+// better elsewhere, such a crossing is not worth an aircraft until a third
+// bearing agrees (in the realistic storyline, two reflected bearings on the
+// confirmed beacon's frequency pulled a verifier off for a ghost).
+TEST(two_crossing_bearings_on_a_localised_frequency_wait_for_a_third) {
+  MeshConfig cfg;
+  cfg.max_diversion_fraction = 1.0;  // so the diversion budget does not hide the rule
+  auto t = std::make_unique<SituationalAwarenessTable>(1, cfg);
+  const TimeMs now = 1'700'000'000'000ULL;
+  const auto add = [&](const GeoPoint& from, const GeoPoint& to, DroneId who) {
+    SensorObservation o = bearingObs(from, to);
+    o.observer_position = from;
+    (void)t->ingestObservation(tableObs(o, who, now, (static_cast<EventId>(who) << 16) | 1U), now);
+  };
+  const GeoPoint main_src = enu(15000, 0);
+  for (DroneId k = 0; k < 4; ++k) add(enu(0, -9000.0 + 6000.0 * k), main_src, static_cast<DroneId>(2 + k));
+  const GeoPoint ghost = enu(20000, -30000);
+  add(enu(0, -24000), ghost, 20);
+  add(enu(0, -36000), ghost, 21);
+  t->refresh(now);
+  updateUrgencies(*t, now);
+  DroneList drones;
+  for (DroneId id = 2; id <= 7; ++id) {
+    DroneState d;
+    d.id = id;
+    d.mode = DroneMode::PACK_ROUTING;
+    d.installed_sensors = maskOf(SensorType::IR);
+    d.position = enu(0, -6000.0 * id);
+    d.speed_mps = 40.0f;
+    d.endurance_remaining_s = 4.0f * 3600.0f;
+    d.bingo_endurance_s = 1800.0f;
+    CHECK(drones.push_back(d));
+  }
+  const auto near_ghost = [&](std::size_t observers) -> const DetectedEvent* {
+    for (const auto& ev : t->events()) {
+      if (ev.localized && ev.observer_count == observers && distanceM(ev.position, ghost) < 3000.0) return &ev;
+    }
+    return nullptr;
+  };
+  const DetectedEvent* pair = near_ghost(2);
+  CHECK(pair != nullptr);
+  if (pair == nullptr) return;
+  CHECK(pair->urgency >= cfg.min_task_urgency);  // urgent enough: only the rule keeps it untasked
+  const EventId pair_id = pair->id;
+  AssignmentList plan;
+  planAssignments(*t, drones, now, cfg, plan);
+  CHECK(!plan.empty());
+  for (const auto& a : plan) CHECK(a.event_id != pair_id);
+
+  add(enu(0, -18000), ghost, 22);  // a third bearing agrees
+  t->refresh(now);
+  updateUrgencies(*t, now);
+  const DetectedEvent* trio = near_ghost(3);
+  CHECK(trio != nullptr);
+  if (trio == nullptr) return;
+  planAssignments(*t, drones, now, cfg, plan);
+  bool tasked = false;
+  for (const auto& a : plan) tasked = tasked || a.event_id == trio->id;
+  CHECK(tasked);
 }
 
 TEST(verifiers_keep_their_roles_and_claim_before_flying) {
@@ -2366,6 +2476,55 @@ TEST(gmcs_keeps_room_for_open_records) {
   CHECK(c.onAlert(makeAlert(999, AlertLevel::PRIORITY, enu(0, -90000), 70.0f, 0, t0), LinkType::LOS, t0) ==
         gmcs::IngestResult::NEW_RECORD);
   CHECK(c.findByEvent(5) == nullptr && c.findByEvent(999) != nullptr);
+}
+
+// A one-frame imaging detection (a glint, clutter) never reaches the pack; a
+// source the imager sees again does, and a confirmed source's later fixes go
+// out at once. In the Monte Carlo, single false fixes that DF bearings on a
+// beacon's frequency happened to cross near were the only false PRIORITYs.
+TEST(one_look_fixes_are_held_until_a_second_confirms) {
+  auto p = std::make_unique<Pack>(2);
+  p->place(0, 0, 0);
+  p->place(1, 0, 5000);
+  p->run(2000);
+  const std::uint32_t sent = p->mgr[0]->stats().observations_sent;
+
+  CHECK(p->mgr[0]->reportLocalDetection(fixObs(SensorType::IR, enu(2000, 1000), 60.0f)));  // one look: held
+  p->run(1000);
+  CHECK(p->mgr[0]->table().events().empty() && p->mgr[1]->table().events().empty());
+  CHECK(p->mgr[0]->stats().local_fixes_held == 1 && p->mgr[0]->stats().observations_sent == sent);
+
+  // A second look from another sensor or at another place does not confirm it.
+  CHECK(p->mgr[0]->reportLocalDetection(fixObs(SensorType::EO, enu(2000, 1000), 60.0f)));
+  CHECK(p->mgr[0]->reportLocalDetection(fixObs(SensorType::IR, enu(6000, 1000), 60.0f)));
+  p->run(1000);
+  CHECK(p->mgr[0]->table().events().empty() && p->mgr[0]->stats().local_fixes_held == 3);
+
+  // The same sensor sees it again, 40 m away: confirmed and shared.
+  CHECK(p->mgr[0]->reportLocalDetection(fixObs(SensorType::IR, enu(2040, 980), 60.0f)));
+  p->run(1000);
+  CHECK(p->mgr[0]->table().events().size() == 1 && p->mgr[1]->table().events().size() == 1);
+  CHECK(p->mgr[0]->stats().local_fixes_held == 3);
+
+  // Later looks at a confirmed source go out at once.
+  CHECK(p->mgr[0]->reportLocalDetection(fixObs(SensorType::IR, enu(2010, 1010), 60.0f)));
+  CHECK(p->mgr[0]->stats().local_fixes_held == 3);
+
+  // After a gap longer than the window the track has lapsed: one look is held again.
+  p->run(MeshConfig{}.fix_confirm_window_ms + 1000);
+  CHECK(p->mgr[0]->reportLocalDetection(fixObs(SensorType::IR, enu(2000, 1000), 60.0f)));
+  CHECK(p->mgr[0]->stats().local_fixes_held == 4);
+
+  // fix_confirm_count = 1 turns confirmation off.
+  MeshConfig one;
+  one.fix_confirm_count = 1;
+  auto q = std::make_unique<Pack>(2, one);
+  q->place(0, 0, 0);
+  q->place(1, 0, 5000);
+  q->run(2000);
+  CHECK(q->mgr[0]->reportLocalDetection(fixObs(SensorType::IR, enu(2000, 1000), 60.0f)));
+  q->run(1000);
+  CHECK(q->mgr[1]->table().events().size() == 1 && q->mgr[0]->stats().local_fixes_held == 0);
 }
 
 // ----------------------------------------------------------------------- main

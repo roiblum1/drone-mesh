@@ -48,19 +48,19 @@ A generic 150 kg-class fixed-wing UAV, not any real product:
 
 - **Visual:** Low on the ground, a small amber glow: a distress beacon with a thermal signature at the edge of a forest. One drone's sweep clips it and an amber bearing line draws from that drone to the ground. A teal arc flares from that drone to its neighbours.
 - **Headline:** *One hears it. All of them know.*
-- **Caption:** The first bearing is shared across the mesh in the next mesh cycle. No operator in the loop yet.
-- **Callout chip:** `Shared within one 0.1 s mesh cycle (simulated)`
+- **Caption:** The first bearing is shared across the mesh as soon as it is taken, and re-sent every 2 s in case a radio fade drops it. No operator in the loop yet.
+- **Callout chip:** `Shared at once · re-sent every 2 s`
 
 ### Panel 4 — "Bearings cross"
 
-- **Visual:** Four more amber lines join, all converging on the glow. On the ground a large translucent ellipse tightens around it. A small label near the ellipse reads `CEP 708 m` (rendered in the slide, not by the image model).
+- **Visual:** Four more amber lines join, all converging on the glow. On the ground a large translucent ellipse tightens around it. A small label near the ellipse reads `CEP 604 m` (rendered in the slide, not by the image model).
 - **Headline:** *Five drones triangulate what one could only hear.*
 - **Caption:** Bearing-only readings from several vantage points fuse into a position, with no drone leaving formation.
-- **Callout chip:** `5 observers · CEP ≈ 0.7 km · early-warning sent`
+- **Callout chip:** `5 observers · CEP ≈ 0.6 km · early warning 12 s after switch-on (simulated)`
 
 ### Panel 5 — "The best-placed two peel off"
 
-- **Visual:** Two aircraft bank away from the formation on different headings, one from the east and one from the north, so the sensor cones hit the source from two angles. The rest of the pack keeps flying line abreast. The operator-controlled aircraft is unaffected. One aircraft in the line carries a small amber fuel icon: it keeps scanning but is not diverted.
+- **Visual:** Two aircraft bank away from the formation on different headings, one from the east and one from the south, so the sensor cones hit the source from two angles. The rest of the pack keeps flying line abreast. The operator-controlled aircraft is unaffected. One aircraft in the line carries a small amber fuel icon: it keeps scanning but is not diverted.
 - **Headline:** *The pack decides who goes. The rest keep watching.*
 - **Caption:** Mission task prioritisation, with no leader: drones are chosen by time-to-target, available sensor type, fuel margin and viewing angle. At most two fifths of the pack ever leave the route.
 - **Callout chip:** `2 verifiers · different angles · 3 keep scanning`
@@ -70,7 +70,7 @@ A generic 150 kg-class fixed-wing UAV, not any real product:
 - **Visual:** The ellipse has collapsed to a bright dot. A single white packet climbs to a LEO satellite, then to a higher GEO satellite, then down to a ground control centre. Inside, the operator's wall display shows a map pin and a short alert card. The mesh arcs in the sky have dimmed to low glow.
 - **Headline:** *The operator gets an answer, not a stream.*
 - **Caption:** Two sensor types confirm the position. One compact alert goes to the operator over the best available link.
-- **Callout chip:** `PRIORITY alert · CEP ≈ 70 m · ~1.7 kbit/s average mesh load per drone`
+- **Callout chip:** `PRIORITY alert · CEP ≈ 70 m · ~2.2 kbit/s average mesh load per drone`
 
 ---
 

@@ -323,8 +323,12 @@ class World {
   // fix, where it was.
   using TruthKey = std::tuple<int, int, TimeMs, std::uint32_t, long long>;
   std::map<TruthKey, std::pair<int, bool>> truth_;
+  // A DF samples every source in one scan, so two sources on one frequency give
+  // two readings with the same observer, time and signature: the bearing (sent
+  // exactly, as a float) tells them apart.
   static TruthKey keyOf(int observer, const SensorObservation& o) {
-    const long long where = o.has_fix ? std::llround(o.fix.lat_deg * 1e5) * 100000000LL + std::llround(o.fix.lon_deg * 1e5) : 0;
+    const long long where = o.has_fix ? std::llround(o.fix.lat_deg * 1e5) * 100000000LL + std::llround(o.fix.lon_deg * 1e5)
+                                      : std::llround(static_cast<double>(o.bearing_deg) * 1e4);
     return {observer, static_cast<int>(o.sensor), o.timestamp_ms, o.signature, where};
   }
   void label(const SimDrone& d, const SensorObservation& o, int emitter, bool reflected) {

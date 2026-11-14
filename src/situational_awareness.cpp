@@ -92,7 +92,9 @@ void absorb(DetectedEvent& k, const DetectedEvent& d) noexcept {
 // A total order on readings that depends only on their content. Fixes come
 // first, tightest first, because they anchor clusters; then bearings, grouped
 // by signature. Ties are broken by every remaining field, so two different
-// readings never compare equal.
+// readings never compare equal. The event hint comes last: it is how the
+// observer filed the reading, not part of it, so copies of one reading filed
+// under different ids sort next to each other (see sameReading).
 bool canonicalLess(const SensorObservation& a, const SensorObservation& b) noexcept {
   if (a.has_fix != b.has_fix) return a.has_fix;
   if (a.has_fix && a.fix_cep_m != b.fix_cep_m) return a.fix_cep_m < b.fix_cep_m;
@@ -101,7 +103,6 @@ bool canonicalLess(const SensorObservation& a, const SensorObservation& b) noexc
   if (a.sensor != b.sensor) return static_cast<std::uint8_t>(a.sensor) < static_cast<std::uint8_t>(b.sensor);
   if (a.timestamp_ms != b.timestamp_ms) return a.timestamp_ms < b.timestamp_ms;
   if (a.signature != b.signature) return a.signature < b.signature;
-  if (a.event_hint != b.event_hint) return a.event_hint < b.event_hint;
   if (a.bearing_deg != b.bearing_deg) return a.bearing_deg < b.bearing_deg;
   if (a.bearing_sigma_deg != b.bearing_sigma_deg) return a.bearing_sigma_deg < b.bearing_sigma_deg;
   if (a.fix.lat_deg != b.fix.lat_deg) return a.fix.lat_deg < b.fix.lat_deg;
@@ -113,11 +114,22 @@ bool canonicalLess(const SensorObservation& a, const SensorObservation& b) noexc
     return a.observer_position.lon_deg < b.observer_position.lon_deg;
   }
   if (a.confidence != b.confidence) return a.confidence < b.confidence;
-  return static_cast<std::uint8_t>(a.class_hint) < static_cast<std::uint8_t>(b.class_hint);
+  if (a.class_hint != b.class_hint) return static_cast<std::uint8_t>(a.class_hint) < static_cast<std::uint8_t>(b.class_hint);
+  return a.event_hint < b.event_hint;
 }
 
+// One reading, whatever event id it was filed under. The observer re-sends its
+// readings every anti-entropy round with the id its own table now uses, so a
+// peer can hold two copies under different hints. Counted twice, the second
+// copy cannot join the first's cluster (one reading per observer and sensor)
+// and stands alone as a phantom event; a lone fix has no frequency, so bearings
+// of any frequency that pass near it then join it. In the realistic storyline
+// that stole the ISM emitter's bearings every few seconds and flipped its
+// verifier on and off.
 bool sameReading(const SensorObservation& a, const SensorObservation& b) noexcept {
-  return !canonicalLess(a, b) && !canonicalLess(b, a);
+  SensorObservation x = a;
+  x.event_hint = b.event_hint;
+  return !canonicalLess(x, b) && !canonicalLess(b, x);
 }
 
 bool holdsKey(const DetectedEvent& ev, DroneId observer, SensorType sensor) noexcept {

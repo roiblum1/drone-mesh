@@ -15,6 +15,7 @@ inline constexpr std::size_t kMaxKnownSignatures = 32;
 inline constexpr std::size_t kMaxAliases = 32;
 inline constexpr std::size_t kMaxPacketBytes = 160;
 inline constexpr std::size_t kMaxRxPerTick = 32;
+inline constexpr std::size_t kMaxFixTracks = 8;  // own imaging detections awaiting or past confirmation
 
 inline constexpr float kNominalEnduranceS = 7.0f * 3600.0f;  // 7-hour combustion EMU nominal endurance
 
@@ -58,6 +59,17 @@ struct MeshConfig {
   // A key epoch is accepted this long before it starts and after it ends, so
   // frames in flight across a re-key are not lost.
   std::uint32_t key_epoch_grace_ms = 10000;
+
+  // ---- own sensors
+  // An imager's fix goes to the pack only once the same sensor has reported
+  // this many agreeing fixes, each within fix_confirm_window_ms of the last
+  // (M-of-N confirmation, as an imaging tracker does). A one-frame false
+  // detection then never reaches the pack. Without it, a 200-trial Monte Carlo
+  // of the 16-drone scenario had 6 false PRIORITY alerts: a single false IR or
+  // EO detection that DF bearings on a beacon's frequency happened to cross
+  // near. Later fixes of a confirmed source go out at once. 1 disables it.
+  unsigned fix_confirm_count = 2;
+  std::uint32_t fix_confirm_window_ms = 5000;
 
   // ---- association and fusion
   // Fusion works in a flat local frame, which holds at pack scale. A reading

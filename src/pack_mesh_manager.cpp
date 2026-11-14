@@ -75,6 +75,10 @@ bool PackMeshManager::reportLocalDetection(SensorObservation obs) noexcept {
     ++stats_.local_rejected;
     return false;
   }
+  if (obs.has_fix && !confirmFix(obs)) {
+    ++stats_.local_fixes_held;
+    return true;  // accepted, held until a second look confirms it
+  }
   if (obs.event_hint == kNoEvent) {
     obs.event_hint = table_.associate(obs);
     if (obs.event_hint == kNoEvent) obs.event_hint = table_.allocateEventId();
@@ -84,6 +88,43 @@ bool PackMeshManager::reportLocalDetection(SensorObservation obs) noexcept {
   obs.event_hint = id;
   if (broadcast(ObservationPayload{obs}, now)) ++stats_.observations_sent;
   return true;
+}
+
+// M-of-N confirmation of this drone's own fixes (MeshConfig::fix_confirm_count).
+// A fix that agrees with an earlier one from the same sensor, within the
+// window, adds a look to that track; otherwise it starts a track, in a free
+// slot or the one heard from longest ago. True once the track has enough looks.
+bool PackMeshManager::confirmFix(const SensorObservation& obs) noexcept {
+  if (cfg_.fix_confirm_count <= 1) return true;
+  const TimeMs t = obs.timestamp_ms;
+  for (auto& tr : fix_tracks_) {
+    if (tr.looks != 0 && elapsedMs(t, tr.last_ms) > cfg_.fix_confirm_window_ms) tr.looks = 0;  // expired
+  }
+  FixTrack* match = nullptr;
+  double best = 0.0;
+  for (auto& tr : fix_tracks_) {
+    if (tr.looks == 0 || tr.sensor != obs.sensor) continue;
+    const double gate = cfg_.association_gate_m +
+                        cfg_.association_cep_factor * (static_cast<double>(tr.cep_m) + static_cast<double>(obs.fix_cep_m));
+    const double d = distanceM(tr.fix, obs.fix);
+    if (d <= gate && (match == nullptr || d < best)) {
+      match = &tr;
+      best = d;
+    }
+  }
+  if (match == nullptr) {
+    match = &fix_tracks_[0];
+    for (auto& tr : fix_tracks_) {  // a free slot, else the one heard from longest ago
+      if (match->looks == 0) break;
+      if (tr.looks == 0 || tr.last_ms < match->last_ms) match = &tr;
+    }
+    *match = FixTrack{obs.sensor, obs.fix, obs.fix_cep_m, t, 0};
+  }
+  match->fix = obs.fix;
+  match->cep_m = obs.fix_cep_m;
+  match->last_ms = std::max(match->last_ms, t);
+  if (match->looks < 255) ++match->looks;
+  return match->looks >= cfg_.fix_confirm_count;
 }
 
 void PackMeshManager::applyGmcsDismissal(std::uint32_t signature) noexcept {

@@ -1,12 +1,13 @@
 // Pack simulation driver.
 //
-//   pack_sim [scenario.scn] [--seed N] [--quiet] [--trace out.json [--trace-period S]]
+//   pack_sim [scenario.scn] [--seed N [--jitter]] [--quiet] [--trace out.json [--trace-period S]]
 //   pack_sim [scenario.scn] --mc N [--threads N] [--mc-json out.json]
 //
 // A single run prints the timeline, a per-drone summary and the scenario's
 // checks, and exits non-zero if any check fails. --mc runs N trials with
 // different seeds (and the scenario's position and timing jitter) and prints
-// the distributions of time to alert, position error and false alerts.
+// the distributions of time to alert, position error and false alerts. It
+// names the seeds of trials with a false PRIORITY; --seed N --jitter replays one.
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -25,7 +26,7 @@ using sim::TrialResult;
 
 void usage() {
   std::fprintf(stderr,
-               "usage: pack_sim [scenario.scn] [--seed N] [--quiet] [--trace out.json] [--trace-period S]\n"
+               "usage: pack_sim [scenario.scn] [--seed N [--jitter]] [--quiet] [--trace out.json] [--trace-period S]\n"
                "       pack_sim [scenario.scn] --mc N [--threads N] [--mc-json out.json]\n");
 }
 
@@ -185,6 +186,16 @@ int monteCarlo(const sim::Scenario& sc, int trials, unsigned threads, const std:
               100.0 * static_cast<double>(std::count_if(false_pri.v.begin(), false_pri.v.end(), [](double x) { return x > 0; })) /
                   static_cast<double>(n));
   std::printf("    causes: %d from clutter, %d a real source mislocalised by multipath\n", false_clutter, false_multipath);
+  if (false_pri_total > 0) {
+    std::printf("    trials with a false PRIORITY (replay with --seed N --jitter):");
+    int shown = 0;
+    for (std::size_t i = 0; i < n && shown < 10; ++i) {
+      if (results[i].false_priorities == 0) continue;
+      std::printf(" %u", sc.seed + static_cast<std::uint32_t>(i) * 7919U);
+      ++shown;
+    }
+    std::printf("\n");
+  }
   std::printf("  duplicate alerts (same source, same level) per trial: mean %.2f, p95 %.0f, max %.0f\n", dup.mean(),
               dup.pct(95), dup.max());
   std::printf("\n  at the GMCS, after the alert consumer's de-duplication:\n");
@@ -282,6 +293,8 @@ int main(int argc, char** argv) {
     if (a == "--seed") {
       opt.seed = static_cast<std::uint32_t>(std::strtoul(next(), nullptr, 0));
       seed_set = true;
+    } else if (a == "--jitter") {
+      opt.mc_jitter = true;  // as a Monte Carlo trial with this seed
     } else if (a == "--quiet") {
       opt.verbose = false;
     } else if (a == "--trace") {

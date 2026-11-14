@@ -20,7 +20,7 @@ The GMCS can route the whole pack but can actively control only one drone in mis
 Needs a C++17 compiler and `make`. No other dependencies. CI builds with GCC and Clang on Ubuntu and Apple Clang on macOS.
 
 ```
-make test       # 64 unit tests
+make test       # 72 unit tests
 make sim        # 6-drone storyline under realistic conditions: timeline, summary, pass/fail checks
 make sim16      # the 16-drone scenario
 make scenarios  # every scenario file, one line each
@@ -61,7 +61,7 @@ What the models add over the original sim:
 - **Clutter:** false imaging detections as a Poisson process per drone.
 - **Ground:** C2 latency per link type at the GMCS.
 
-`pack_sim <file> --mc N` runs N trials, reseeding every random process and moving each source by up to the scenario's jitter. It reports time to first alert, time to PRIORITY and PRIORITY error, each as p5, p50, p95 and max. It also reports false alerts, split by cause (clutter, or a real source mislocalised by multipath, from the sim's ground-truth label on every reading), duplicates, FCS requests, mesh load and the pass rate of every check. `--mc-json` writes the distributions. A run is a pure function of (scenario, seed); the Monte Carlo output does not depend on the thread count.
+`pack_sim <file> --mc N` runs N trials, reseeding every random process and moving each source by up to the scenario's jitter. It reports time to first alert, time to PRIORITY and PRIORITY error, each as p5, p50, p95 and max. It also reports false alerts, split by cause (clutter, or a real source mislocalised by multipath, from the sim's ground-truth label on every reading), duplicates, FCS requests, mesh load and the pass rate of every check. `--mc-json` writes the distributions. It names the seeds of any trial with a false PRIORITY; `pack_sim <file> --seed N --jitter` replays that trial with its timeline. A run is a pure function of (scenario, seed); the Monte Carlo output does not depend on the thread count.
 
 ### Replay viewer
 
@@ -69,7 +69,7 @@ What the models add over the original sim:
 
 ### What the realistic simulation found
 
-Running the flight code under these conditions exposed defects that the synchronised, idealised sim had hidden. All of them are fixed in the flight library and covered by unit tests:
+Running the flight code under these conditions exposed defects that the synchronised, idealised sim had hidden. All of them are fixed in the flight library and covered by unit tests. Numbers in brackets were measured when each fix went in; the current results are in deliverable 2, section 3.
 
 | Defect | Fix |
 |---|---|
@@ -82,6 +82,11 @@ Running the flight code under these conditions exposed defects that the synchron
 | A regrouped source lost its "alert sent" flag and was alerted again; a confirmed source was re-verified after its fixes aged out | A ledger of alerts by id and by place |
 | A missed `ALERT_ISSUED` notice in a radio fade let a backup drone alert again | Each drone repeats its notices for 20 s |
 | Lone bearings and reflections on a frequency already localised competed for verifiers with the real source | Their urgency is halved, and a lone bearing on a localised frequency is not tasked |
+| A one-frame false IR or EO detection, and three or four DF bearings on a beacon's frequency (mostly reflections) that happened to cross near it, made a false PRIORITY (6 in a 200-trial run of the 16-drone scenario) | Each drone confirms its own imaging detections over two looks before it shares them, as an imaging tracker does (`fix_confirm_count`) |
+| A reading re-sent under the id the observer's table had since moved it to was counted twice. The copy stood alone as an event with no frequency, collected another frequency's bearings that passed near it, and turned a verifier on and off every few seconds | A reading is the same reading whatever id it was filed under |
+| Two reflected bearings on a confirmed beacon's frequency crossed 8 km from it and pulled a verifier off for the ghost | On a frequency localised better elsewhere, a crossing of fewer than three bearings is not tasked (the same bar as a bearing-only ADVISORY) |
+
+The last three were found in the final 200-trial runs, after the 40-trial runs had shown no false PRIORITY. One was in the simulator itself: its ground-truth labels for two sources on one frequency, sampled in the same DF scan, overwrote each other. That only affected the false-alert accounting; it is fixed too.
 
 ## Continuous integration
 
@@ -115,7 +120,7 @@ Running the flight code under these conditions exposed defects that the synchron
 
 ### Pack independence: how a pack decides with no leader
 
-1. Each drone broadcasts a heartbeat (1 Hz) with its position, fuel, active sensor and mode, and each sensor reading as it happens.
+1. Each drone broadcasts a heartbeat (1 Hz) with its position, fuel, active sensor and mode, and each sensor reading as it happens; an imager's detection once a second look has confirmed it.
 2. Every drone folds the same readings into the same table. Own readings are re-sent every 2 s, so a lost packet only delays convergence. On every refresh the table re-clusters all its readings from scratch in a canonical order (fixes first, then bearings one frequency at a time), so which readings form an event, and the event's id, depend only on the set of readings: not on the order they arrived in, and not on which drone holds them. An event's id is the lowest id its readings carry, so ids converge across the pack; every id that moves keeps an alias.
 3. `evaluateAndCoordinateAlerts()` runs every 0.5 s on every drone: fuse bearings into positions, merge duplicate events, rank by urgency (mission task prioritisation), and compute the verifier plan. The plan is a deterministic function of the table, so drones with the same table agree without negotiating.
 4. A drone that finds itself in the plan sends a request to the FCS (standoff point, approach bearing, sensor to cue) and claims its slot on the mesh. Claims are arbitrated by score (quantised, so every drone ends with the same holder whatever the arrival order), ties by lowest id. A drone that loses arbitration is not ordered off its task; it gives way at the next plan, because the winner now holds the incumbent bonus.
@@ -130,7 +135,7 @@ Running the flight code under these conditions exposed defects that the synchron
 - **Dismissal.** The operator declares a record benign. If it carries a frequency, the consumer sends it to the pack through `IUplink`, retrying until the C2 link accepts it, and every drone then learns it. If the pack keeps alerting on a dismissed frequency, the uplink is sent again. A record with no frequency (a fire, say) can only be suppressed at the GMCS, by place. A frequency the pack never alerted on can be dismissed directly.
 - **Latency.** Transport time (drone issue to GMCS receipt) per link, first detection to receipt per alert level, and operator receipt to acknowledgement, in fixed-bin histograms.
 
-The simulator runs every alert through it. In the 16-drone Monte Carlo, raw duplicate alerts (0.47 per trial) become 0.03 duplicate records.
+The simulator runs every alert through it. In the 16-drone Monte Carlo, raw duplicate alerts (0.29 per trial) become 0.01 duplicate records.
 
 ### Rules the flight library follows
 
@@ -164,9 +169,15 @@ Each reason a frame is refused is counted separately in `MeshStats` (`rx_auth_fa
 
 ## What was verified
 
-- `make test`: 40 tests, 635 checks pass in the release build and under ASan/UBSan, including regression tests for every confirmed finding of an independent code review (see below).
-- clang-tidy (bugprone, CERT, clang-analyzer, performance and selected Core Guidelines checks) and cppcheck report nothing on the flight library.
-- `make sim`: all 11 scenario checks pass; output is byte-identical across runs and across the release and sanitizer builds.
+- `make test`: 72 tests, 1181 checks pass in the release build and under ASan/UBSan. They include regression tests for every confirmed finding of the independent code review (see below) and for every defect the realistic simulation found. Each of the last three fixes was checked by reverting it: a test fails.
+- clang-tidy (bugprone, CERT, clang-analyzer, performance and selected Core Guidelines checks) and cppcheck report nothing on the flight library or the GMCS consumer.
+- `make scenarios`: every check in the three scenario files passes. Each run is byte-identical from one run to the next and between the release and sanitizer builds.
+- Monte Carlo, 200 trials of each scenario (deliverable 2, section 3.1):
+  - no false PRIORITY in 600 trials;
+  - PRIORITY on the storyline's beacon in 98 % of trials, median 224 s after switch-on;
+  - 0.09 false ADVISORY per drone-hour in the storyline and 0.24 in the 16-drone pack, every one a real source mislocalised by multipath.
+- Fuzzing: libFuzzer with ASan and UBSan ran 365,000 inputs on the final code (7 minutes), and about 1.9 million more on earlier versions during this work, with no crash and no property failure. CI fuzzes for 120 s on every push.
+- ChaCha20-Poly1305 matches the RFC 8439 test vectors and OpenSSL on 858 random cases.
 - A 20,000-trial Monte Carlo of the triangulation shows the reported CEP is calibrated for well-conditioned geometry (about 50 % of fixes inside it) with heavy tails for poor geometry. Details in deliverable 2.
 
 ## What is not done
@@ -178,13 +189,14 @@ These are the open items you should know about before relying on any of this:
 - **The boot session must persist.** It has to come from a non-volatile counter that increases on every boot. If it repeats, nonces repeat and the mesh loses secrecy and integrity. Key fill, key storage and the C2 re-key message are outside this repo.
 - **No flight validation.** All performance numbers come from a software simulation. Its radio, terrain, multipath and clutter models are generic, with parameters chosen to be plausible, not measured on the real radio, DF or airframe.
 - **The mesh does not relay.** Every frame is one hop. A pack wider than the radio range splits into groups that cannot hear each other, and each group alerts on its own. `pack16.scn` keeps the pack inside 60 km for that reason.
-- **Single-sensor thermal detections raise an ADVISORY.** One IR detection of a thermal hazard is a fix with confidence 0.8, which meets the advisory gate. In `pack16.scn` IR clutter (0.2 false detections per drone-hour) is about half of the false advisories. Requiring two observers for a fix-only ADVISORY would remove them, at the cost of later warnings for a fire only one drone has seen; that is a programme decision.
+- **One drone's thermal detection can raise an ADVISORY.** An IR detection of a thermal hazard, once a second look confirms it, is a fix with confidence 0.8, which meets the advisory gate. The simulator's clutter lasts one frame, so confirmation removes it (none of the false alerts in 600 trials). Persistent clutter, such as a sun-heated rock, is not modelled and would get through. Requiring two drones for a fix-only ADVISORY would stop it, at the cost of a later warning for a fire only one drone has seen; that is a programme decision.
+- **Persistent clutter could still corroborate itself.** A PRIORITY on a fix plus bearings counts only bearings that fit the fix and no other source on the frequency. Those bearings are chosen because they pass near the fix, so on a busy frequency a confirmed false detection could still collect three that cross near it. It took a one-frame false detection and reflections to do that in the simulation, and confirmation removed it, but the test is not independent of the fix.
 - **The Model 8270's real interfaces are assumed.** Everything touches hardware through `hal.hpp`; the bus choices in deliverable 3 are recommendations, not an ICD.
 - **The FCS interface has no reply.** A real one needs accept / refuse.
 - **Time assumes a shared GNSS-disciplined clock.** GNSS-denied operation is not handled.
 - **The corridor is a circle.** A real approved corridor is a polygon.
 - **A pack member can still lie in its own name.** Authentication proves which drone sent a frame, not that its content is true. A drone that holds a valid key can report false readings or send a `SIGNATURE_UPDATE` that dismisses a frequency pack-wide. Content checks limit the damage (ranges, a drone speaks only for itself); revocation removes the drone.
-- **A partition doubles the alerts.** Each side of a split mesh localises the source under its own id and alerts the GMCS. After the heal the pack converges on one event and does not alert again (tested), but the GMCS has two records to fold into one.
+- **A partition doubles the alerts.** Each side of a split mesh localises the source under its own id and alerts the GMCS. After the heal the pack converges on one event and does not alert again (tested). The GMCS alert consumer folds the second alert into the first record by place, so the operator sees one record, but two alerts did cross the C2 links.
 - **Re-clustering is greedy, not optimal.** It is deterministic and does not fragment a source under bearing noise, but it is not a global assignment. Two sources on one frequency, seen only by bearings, at an awkward geometry can still be grouped wrongly until a fix or more geometry arrives, and every drone then makes the same mistake.
 - **Bearing-only readings with no signature are never triangulated.** Readings are linked by frequency until a position exists. Every RF direction-finder reports a frequency, so this only matters for a sensor that does not.
 - **Plans assume nearly synchronous state.** Each drone plans from its own fresh state, its peers' last heartbeats (up to 1 s old) and its own clock. Claims and the incumbent bonus absorb the small differences; large clock disagreement is not handled.

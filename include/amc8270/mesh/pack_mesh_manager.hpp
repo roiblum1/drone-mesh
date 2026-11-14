@@ -5,6 +5,7 @@
 // every loop is bounded by a compile-time capacity.
 #pragma once
 
+#include <array>
 #include <cstdint>
 
 #include "amc8270/mesh/config.hpp"
@@ -27,6 +28,7 @@ struct MeshStats {
   std::uint32_t rx_revoked = 0;      // from a drone the GMCS revoked
   std::uint32_t tx_no_key = 0;       // nothing sent: no key epoch valid for sending now
   std::uint32_t local_rejected = 0;  // implausible input from this drone's own avionics
+  std::uint32_t local_fixes_held = 0;  // own fixes held back as unconfirmed (first look of a source)
   std::uint32_t peers_discovered = 0;
   std::uint32_t peers_lost = 0;
   std::uint32_t observations_sent = 0;
@@ -103,6 +105,7 @@ class PackMeshManager {
   void syncOwnTask(const Assignment* mine, TimeMs now) noexcept;
   void cancelTask(bool notify_guidance) noexcept;
   void dispatchAlerts(TimeMs now) noexcept;
+  [[nodiscard]] bool confirmFix(const SensorObservation& obs) noexcept;
 
   DroneId self_;
   MeshConfig cfg_;
@@ -133,6 +136,15 @@ class PackMeshManager {
     TimeMs at_ms = 0;
   };
   StaticVector<IssuedAlert, 8> issued_{};  // own recent alerts, re-announced by anti-entropy
+  // Own imaging detections, by sensor and place, for fix confirmation.
+  struct FixTrack {
+    SensorType sensor = SensorType::NONE;
+    GeoPoint fix{};
+    float cep_m = 0.0f;
+    TimeMs last_ms = 0;
+    std::uint8_t looks = 0;  // 0: slot free
+  };
+  std::array<FixTrack, kMaxFixTracks> fix_tracks_{};
   bool heartbeat_requested_ = false;
   MeshStats stats_{};
 };

@@ -49,6 +49,18 @@ bool betterSupported(const DetectedEvent& a, const DetectedEvent& b) noexcept {
   return a.id < b.id;
 }
 
+// Bearings only, and too few to stand on their own: unlocalised, or fewer than
+// advisory_min_bearings (the same bar a bearing-only ADVISORY has to clear).
+bool thinBearingOnly(const DetectedEvent& ev, const MeshConfig& cfg) noexcept {
+  if (!ev.localized) return true;
+  unsigned bearings = 0;
+  for (const auto& o : ev.observations) {
+    if (o.has_fix) return false;
+    ++bearings;
+  }
+  return bearings < cfg.advisory_min_bearings;
+}
+
 }  // namespace
 
 void updateUrgencies(SituationalAwarenessTable& table, TimeMs now) noexcept {
@@ -183,12 +195,18 @@ void planAssignments(const SituationalAwarenessTable& table, const DroneList& dr
   for (std::size_t k = 0; k < n_events && used < budget; ++k) {
     const DetectedEvent& ev = events[order[k]];
     if (!eligibleForTasking(ev, now, cfg)) continue;
-    // A lone bearing on a frequency the pack has already localised elsewhere is that
-    // source mid-update or a reflection, not worth an aircraft. A lone bearing alone
-    // on its frequency still gets a look along it.
-    if (!ev.localized && ev.signature != 0) {
+    // A lone bearing, or a crossing of fewer than advisory_min_bearings bearings, on
+    // a frequency the pack has localised better elsewhere is that source mid-update
+    // or a reflection, not worth an aircraft: two lines always cross somewhere, and
+    // two reflected bearings on a confirmed beacon's frequency made such ghosts in the
+    // realistic simulation. The better-supported event is tasked; a lone bearing
+    // alone on its frequency still gets a look along it.
+    if (ev.signature != 0 && thinBearingOnly(ev, cfg)) {
       bool sibling = false;
-      for (const auto& other : events) sibling = sibling || (&other != &ev && other.localized && other.signature == ev.signature);
+      for (const auto& other : events) {
+        sibling = sibling ||
+                  (&other != &ev && other.localized && other.signature == ev.signature && betterSupported(other, ev));
+      }
       if (sibling) continue;
     }
 
