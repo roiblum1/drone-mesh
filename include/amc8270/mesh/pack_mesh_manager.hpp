@@ -11,6 +11,7 @@
 #include "amc8270/mesh/coordination.hpp"
 #include "amc8270/mesh/hal.hpp"
 #include "amc8270/mesh/mesh_packet.hpp"
+#include "amc8270/mesh/mesh_security.hpp"
 #include "amc8270/mesh/situational_awareness.hpp"
 
 namespace amc8270::mesh {
@@ -18,7 +19,13 @@ namespace amc8270::mesh {
 struct MeshStats {
   std::uint32_t tx_packets = 0;
   std::uint32_t rx_packets = 0;
-  std::uint32_t rx_rejected = 0;     // bad CRC / framing / range / sender mismatch
+  std::uint32_t rx_rejected = 0;     // bad framing, or an authentic frame with bad content or sender mismatch
+  std::uint32_t rx_auth_failed = 0;  // tag did not verify: corrupted, forged, or another key
+  std::uint32_t rx_no_key = 0;       // key epoch unknown or outside its validity window
+  std::uint32_t rx_replayed = 0;     // authentic, but already accepted or from an older boot session
+  std::uint32_t rx_stale = 0;        // authentic, but sent too long ago or stamped in the future
+  std::uint32_t rx_revoked = 0;      // from a drone the GMCS revoked
+  std::uint32_t tx_no_key = 0;       // nothing sent: no key epoch valid for sending now
   std::uint32_t local_rejected = 0;  // implausible input from this drone's own avionics
   std::uint32_t peers_discovered = 0;
   std::uint32_t peers_lost = 0;
@@ -36,8 +43,11 @@ struct MeshStats {
 class PackMeshManager {
  public:
   // `cfg` must satisfy isValid(cfg) (validation.hpp); check it before constructing.
-  PackMeshManager(DroneId self, const MeshConfig& cfg, IClock& clock, IMeshTransceiver& radio, IGmcsLink& gmcs,
-                  IGuidanceSink& guidance) noexcept;
+  // `boot_session` must be greater than on any earlier boot of this drone (a
+  // non-volatile boot counter): it is part of every frame's nonce. See mesh_security.hpp.
+  // Nothing is sent or accepted until a key epoch is installed.
+  PackMeshManager(DroneId self, const MeshConfig& cfg, std::uint32_t boot_session, IClock& clock,
+                  IMeshTransceiver& radio, IGmcsLink& gmcs, IGuidanceSink& guidance) noexcept;
   PackMeshManager(const PackMeshManager&) = delete;
   PackMeshManager& operator=(const PackMeshManager&) = delete;
   PackMeshManager(PackMeshManager&&) = delete;
@@ -57,6 +67,15 @@ class PackMeshManager {
   // Mission-data signature known to all drones (not re-broadcast).
   void addKnownBenignSignature(std::uint32_t signature) noexcept;
 
+  // ---- keys: mission data load, or GMCS re-key over the C2 link ---------
+  [[nodiscard]] bool installEpochKey(std::uint16_t epoch, const crypto::Key& key, TimeMs valid_from_ms,
+                                     TimeMs valid_until_ms) noexcept;
+  bool eraseEpochKey(std::uint16_t epoch) noexcept;
+  void zeroizeKeys() noexcept;  // emergency erase: the drone falls silent on the mesh
+  // GMCS order: refuse `id` from now on, drop it from the pack and forget its
+  // readings. Re-keying without it (a new epoch it is not given) completes the exclusion.
+  [[nodiscard]] bool revokeDrone(DroneId id) noexcept;
+
   // ---- periodic work ---------------------------------------------------
   void tick() noexcept;
   // Fuse, rank, nominate verifiers, issue alerts. Called from tick() every
@@ -70,6 +89,7 @@ class PackMeshManager {
   bool isVerifying() const noexcept { return task_active_; }
   const VerificationTask& currentTask() const noexcept { return task_; }
   const MeshStats& stats() const noexcept { return stats_; }
+  const MeshSecurity& security() const noexcept { return security_; }
   DroneId selfId() const noexcept { return self_; }
 
  private:
@@ -91,12 +111,12 @@ class PackMeshManager {
   IGmcsLink& gmcs_;
   IGuidanceSink& guidance_;
 
+  MeshSecurity security_;
   SituationalAwarenessTable table_;
   DroneState own_{};
   VerificationTask task_{};
   bool task_active_ = false;
 
-  std::uint32_t seq_ = 0;
   TimeMs last_heartbeat_ms_ = 0;
   TimeMs last_anti_entropy_ms_ = 0;
   TimeMs last_eval_ms_ = 0;

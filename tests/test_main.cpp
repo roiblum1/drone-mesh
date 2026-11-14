@@ -10,7 +10,9 @@
 #include <memory>
 #include <new>
 
+#include "amc8270/mesh/crypto.hpp"
 #include "amc8270/mesh/geo.hpp"
+#include "amc8270/mesh/mesh_security.hpp"
 #include "amc8270/mesh/pack_mesh_manager.hpp"
 #include "amc8270/mesh/validation.hpp"
 
@@ -43,7 +45,7 @@ struct TestCase {
   const char* name;
   void (*fn)();
 };
-static std::array<TestCase, 64> g_tests{};
+static std::array<TestCase, 128> g_tests{};
 static std::size_t g_n_tests = 0;
 struct Registrar {
   Registrar(const char* n, void (*f)()) { g_tests[g_n_tests++] = {n, f}; }
@@ -59,6 +61,15 @@ static GeoPoint enu(double e, double n, float alt = 3000.0f) {
   static const LocalFrame frame(kOrigin);
   return frame.fromEnu(Vec2{e, n}, alt);
 }
+
+// Test keys only. Byte pattern makes two keys with different seeds differ everywhere.
+static crypto::Key testKey(std::uint8_t seed) {
+  crypto::Key k{};
+  for (std::size_t i = 0; i < k.size(); ++i) k[i] = static_cast<std::uint8_t>(seed * 31U + i * 7U + 1U);
+  return k;
+}
+static const crypto::Key kPackKey = testKey(1);
+constexpr std::uint16_t kPackEpoch = 1;
 
 struct FakeClock : IClock {
   TimeMs now = 1'700'000'000'000ULL;
@@ -99,9 +110,15 @@ class Bus {
   }
 
   bool broadcastFrom(int src, const std::uint8_t* d, std::size_t n) {
+    if (src == record_src && tape_n < tape.size()) {
+      std::memcpy(tape[tape_n].data.data(), d, n);
+      tape[tape_n].len = n;
+      ++tape_n;
+    }
     if (isolated[static_cast<std::size_t>(src)]) return true;
     for (int dst = 0; dst < kMaxNodes; ++dst) {
       if (dst == src || isolated[static_cast<std::size_t>(dst)]) continue;
+      if (group[static_cast<std::size_t>(dst)] != group[static_cast<std::size_t>(src)]) continue;
       if (drop_permille != 0) {
         rng ^= rng << 13;
         rng ^= rng >> 17;
@@ -120,7 +137,13 @@ class Bus {
 
   std::array<Node, kMaxNodes> nodes{};
   std::array<bool, kMaxNodes> isolated{};
+  // Nodes in different groups cannot hear each other (a mesh partition).
+  std::array<int, kMaxNodes> group{};
   unsigned drop_permille = 0;
+  // Every datagram node `record_src` sends is also copied onto the tape.
+  int record_src = -1;
+  std::array<Datagram, 128> tape{};
+  std::size_t tape_n = 0;
   std::uint32_t rng = 2463534242u;
 };
 
@@ -165,8 +188,17 @@ struct Pack {
   explicit Pack(std::size_t count, const MeshConfig& cfg = MeshConfig{}) : n(count) {
     for (std::size_t i = 0; i < n; ++i) {
       const std::size_t k = i;
-      mgr[i] = std::make_unique<PackMeshManager>(static_cast<DroneId>(i + 1), cfg, clock, bus.nodes[k], gmcs[k], guidance[k]);
+      mgr[i] = std::make_unique<PackMeshManager>(static_cast<DroneId>(i + 1), cfg, 1U, clock, bus.nodes[k], gmcs[k],
+                                                 guidance[k]);
+      if (!mgr[i]->installEpochKey(kPackEpoch, kPackKey, 0, kNoExpiry)) std::abort();
     }
+  }
+
+  // Power-cycle drone i+1 with a new boot session (its tables start empty).
+  void reboot(std::size_t i, std::uint32_t session, const MeshConfig& cfg = MeshConfig{}) {
+    mgr[i] = std::make_unique<PackMeshManager>(static_cast<DroneId>(i + 1), cfg, session, clock, bus.nodes[i], gmcs[i],
+                                               guidance[i]);
+    if (!mgr[i]->installEpochKey(kPackEpoch, kPackKey, 0, kNoExpiry)) std::abort();
   }
 
   // Drone i+1 at (e, n); default full fuel, RF_DF + IR.
@@ -265,11 +297,6 @@ TEST(static_vector_basics) {
   CHECK(v.empty());
 }
 
-TEST(crc32_known_vector) {
-  const char* s = "123456789";
-  CHECK(crc32(reinterpret_cast<const std::uint8_t*>(s), 9) == 0xCBF43926u);
-}
-
 TEST(geo_round_trip) {
   const GeoPoint a = enu(0, 0);
   const GeoPoint b = destinationPoint(a, 63.0, 12345.0);
@@ -279,131 +306,6 @@ TEST(geo_round_trip) {
   const LocalFrame f(kOrigin);
   const Vec2 v = f.toEnu(f.fromEnu(Vec2{1234.5, -987.6}, 0.0f));
   CHECK(std::fabs(v.e - 1234.5) < 1e-6 && std::fabs(v.n + 987.6) < 1e-6);
-}
-
-TEST(packet_round_trip_all_types) {
-  std::array<std::uint8_t, kMaxPacketBytes> buf{};
-  MeshPacket in;
-  in.header = PacketHeader{7, 42, 1'700'000'123'456ULL};
-
-  DroneState s;
-  s.id = 7;
-  s.mode = DroneMode::VERIFYING;
-  s.active_sensor = SensorType::IR;
-  s.installed_sensors = maskOf(SensorType::IR) | maskOf(SensorType::RF_DF);
-  s.available_links = kLinkMaskAll;
-  s.position = GeoPoint{36.1234567, -11.7654321, 3123.5f};
-  s.speed_mps = 41.5f;
-  s.heading_deg = 77.0f;
-  s.endurance_remaining_s = 20000.0f;
-  s.bingo_endurance_s = 1800.0f;
-  s.tasked_event = 0x00070001u;
-  s.timestamp_ms = 1'700'000'123'400ULL;
-  in.payload = HeartbeatPayload{s};
-  std::size_t n = encodePacket(in, buf.data(), buf.size());
-  CHECK(n > 0 && n <= kMaxPacketBytes);
-  MeshPacket out;
-  CHECK(decodePacket(buf.data(), n, out));
-  CHECK(out.type() == MsgType::HEARTBEAT);
-  CHECK(out.header.src == 7 && out.header.seq == 42 && out.header.time_ms == in.header.time_ms);
-  const auto* hb = std::get_if<HeartbeatPayload>(&out.payload);
-  CHECK(hb != nullptr);
-  if (hb != nullptr) {
-    CHECK(hb->state.mode == DroneMode::VERIFYING && hb->state.active_sensor == SensorType::IR);
-    CHECK(std::fabs(hb->state.position.lat_deg - 36.1234567) < 1e-7);
-    CHECK(std::fabs(hb->state.position.lon_deg + 11.7654321) < 1e-7);
-    CHECK(hb->state.endurance_remaining_s == 20000.0f && hb->state.tasked_event == 0x00070001u);
-    CHECK(hb->state.installed_sensors == s.installed_sensors && hb->state.available_links == kLinkMaskAll);
-  }
-
-  SensorObservation o = bearingObs(enu(0, 0), enu(5000, 5000), 0.0);
-  o.observer = 3;
-  o.event_hint = 0x00030001u;
-  o.observer_position = enu(0, 0);
-  o.timestamp_ms = 1'700'000'000'500ULL;
-  in.payload = ObservationPayload{o};
-  n = encodePacket(in, buf.data(), buf.size());
-  CHECK(n > 0 && decodePacket(buf.data(), n, out));
-  const auto* ob = std::get_if<ObservationPayload>(&out.payload);
-  CHECK(ob != nullptr);
-  if (ob != nullptr) {
-    CHECK(ob->obs.observer == 3 && ob->obs.sensor == SensorType::RF_DF && !ob->obs.has_fix);
-    CHECK(ob->obs.signature == 406025u && ob->obs.event_hint == 0x00030001u);
-    CHECK(std::fabs(ob->obs.bearing_deg - o.bearing_deg) < 1e-3f);
-  }
-
-  in.payload = TaskClaimPayload{0x00030001u, 5, 1, 0.77f};
-  n = encodePacket(in, buf.data(), buf.size());
-  CHECK(n > 0 && decodePacket(buf.data(), n, out));
-  const auto* tc = std::get_if<TaskClaimPayload>(&out.payload);
-  CHECK(tc != nullptr && tc->claimant == 5 && tc->role == 1 && tc->score == 0.77f);
-
-  in.payload = AlertIssuedPayload{0x00030001u, AlertLevel::PRIORITY, 4};
-  n = encodePacket(in, buf.data(), buf.size());
-  CHECK(n > 0 && decodePacket(buf.data(), n, out));
-  const auto* ai = std::get_if<AlertIssuedPayload>(&out.payload);
-  CHECK(ai != nullptr && ai->level == AlertLevel::PRIORITY && ai->issuer == 4);
-
-  in.payload = SignatureUpdatePayload{433920u};
-  n = encodePacket(in, buf.data(), buf.size());
-  CHECK(n > 0 && decodePacket(buf.data(), n, out));
-  const auto* su = std::get_if<SignatureUpdatePayload>(&out.payload);
-  CHECK(su != nullptr && su->signature == 433920u);
-
-  in.payload = LeavePayload{};
-  n = encodePacket(in, buf.data(), buf.size());
-  CHECK(n == kHeaderBytes + kCrcBytes && decodePacket(buf.data(), n, out));
-  CHECK(out.type() == MsgType::LEAVE);
-}
-
-TEST(packet_rejects_corruption) {
-  std::array<std::uint8_t, kMaxPacketBytes> buf{};
-  MeshPacket in;
-  in.header = PacketHeader{2, 1, 1000};
-  DroneState s;
-  s.id = 2;
-  s.installed_sensors = 1;
-  in.payload = HeartbeatPayload{s};
-  const std::size_t n = encodePacket(in, buf.data(), buf.size());
-  CHECK(n > 0);
-  MeshPacket out;
-  CHECK(decodePacket(buf.data(), n, out));
-
-  // Any single flipped byte must be rejected (CRC, magic, length or range checks).
-  int accepted = 0;
-  for (std::size_t i = 0; i < n; ++i) {
-    std::array<std::uint8_t, kMaxPacketBytes> bad = buf;
-    bad[i] = static_cast<std::uint8_t>(bad[i] ^ 0x5A);
-    if (decodePacket(bad.data(), n, out)) ++accepted;
-  }
-  CHECK(accepted == 0);
-
-  // Truncation and oversize.
-  for (std::size_t len = 0; len < n; ++len) CHECK(!decodePacket(buf.data(), len, out));
-  CHECK(!decodePacket(buf.data(), kMaxPacketBytes + 1, out));
-  CHECK(!decodePacket(nullptr, 10, out));
-
-  // A well-formed frame carrying NaN or an out-of-range latitude is refused.
-  s.speed_mps = std::nanf("");
-  in.payload = HeartbeatPayload{s};
-  const std::size_t n2 = encodePacket(in, buf.data(), buf.size());
-  CHECK(n2 > 0 && !decodePacket(buf.data(), n2, out));
-  s.speed_mps = 1.0f;
-  s.position.lat_deg = 91.0;
-  in.payload = HeartbeatPayload{s};
-  const std::size_t n3 = encodePacket(in, buf.data(), buf.size());
-  CHECK(n3 > 0 && !decodePacket(buf.data(), n3, out));
-
-  // Heartbeat whose body id disagrees with the header src is spoofed/corrupt.
-  s.position.lat_deg = 36.0;
-  s.id = 9;
-  in.payload = HeartbeatPayload{s};
-  const std::size_t n4 = encodePacket(in, buf.data(), buf.size());
-  CHECK(n4 > 0 && !decodePacket(buf.data(), n4, out));
-
-  // Output buffer too small.
-  std::array<std::uint8_t, 10> tiny{};
-  CHECK(encodePacket(in, tiny.data(), tiny.size()) == 0);
 }
 
 TEST(triangulation_exact_and_weighted) {
@@ -1007,6 +909,533 @@ TEST(observation_slot_replacement_and_expiry) {
   CHECK(t.events().empty());
 }
 
+// ------------------------------------------------------- crypto and frames
+
+static std::size_t fromHex(const char* hex, std::uint8_t* out, std::size_t cap) {
+  std::size_t n = 0;
+  for (std::size_t i = 0; hex[i] != '\0' && hex[i + 1] != '\0' && n < cap; i += 2) {
+    const auto nib = [](char c) -> unsigned {
+      return c <= '9' ? static_cast<unsigned>(c - '0') : static_cast<unsigned>(c - 'a' + 10);
+    };
+    out[n++] = static_cast<std::uint8_t>((nib(hex[i]) << 4U) | nib(hex[i + 1]));
+  }
+  return n;
+}
+
+static bool equalsHex(const std::uint8_t* data, std::size_t n, const char* hex) {
+  std::array<std::uint8_t, 512> want{};
+  return fromHex(hex, want.data(), want.size()) == n && std::memcmp(data, want.data(), n) == 0;
+}
+
+static const char kSunscreen[] =
+    "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
+
+TEST(crypto_rfc8439_vectors) {
+  using namespace crypto;
+  // 2.3.2: block function.
+  Key k{};
+  for (std::size_t i = 0; i < k.size(); ++i) k[i] = static_cast<std::uint8_t>(i);
+  Nonce n{};
+  fromHex("000000090000004a00000000", n.data(), n.size());
+  std::array<std::uint8_t, 64> block{};
+  chacha20Block(k, 1, n, block.data());
+  CHECK(equalsHex(block.data(), 64,
+                  "10f1e7e4d13b5915500fdd1fa32071c4c7d1f4c733c068030422aa9ac3d46c4e"
+                  "d2826446079faa0914c2d705d98b02a2b5129cd1de164eb9cbd083e8a2503c4e"));
+
+  // 2.4.2: encryption.
+  const std::size_t len = sizeof kSunscreen - 1;
+  const auto* pt = reinterpret_cast<const std::uint8_t*>(kSunscreen);
+  std::array<std::uint8_t, 128> ct{};
+  fromHex("000000000000004a00000000", n.data(), n.size());
+  chacha20Xor(k, 1, n, pt, ct.data(), len);
+  CHECK(equalsHex(ct.data(), len,
+                  "6e2e359a2568f98041ba0728dd0d6981e97e7aec1d4360c20a27afccfd9fae0bf91b65c5524733ab8f593dabcd62b3571639"
+                  "d624e65152ab8f530c359f0861d807ca0dbf500d6a6156a38e088a22b65e52bc514d16ccf806818ce91ab77937365af90bbf"
+                  "74a35be6b40b8eedf2785e42874d"));
+
+  // 2.5.2: Poly1305, one-shot and fed in odd-sized pieces.
+  std::array<std::uint8_t, 32> pk{};
+  fromHex("85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b", pk.data(), pk.size());
+  const char* msg = "Cryptographic Forum Research Group";
+  const auto* m = reinterpret_cast<const std::uint8_t*>(msg);
+  Tag t1{};
+  {
+    Poly1305 mac(pk.data());
+    mac.update(m, 34);
+    mac.finish(t1);
+  }
+  CHECK(equalsHex(t1.data(), 16, "a8061dc1305136c6c22b8baf0c0127a9"));
+  Tag t2{};
+  {
+    Poly1305 mac(pk.data());
+    mac.update(m, 3);
+    mac.update(m + 3, 0);
+    mac.update(m + 3, 17);
+    mac.update(m + 20, 14);
+    mac.finish(t2);
+  }
+  CHECK(t1 == t2);
+
+  // Appendix A.3 #5-#11: inputs chosen to hit the carries and the final reduction mod 2^130 - 5.
+  struct PolyEdge {
+    const char* key;
+    const char* msg;
+    const char* tag;
+  };
+  static const PolyEdge kEdges[] = {
+      {"0200000000000000000000000000000000000000000000000000000000000000", "ffffffffffffffffffffffffffffffff",
+       "03000000000000000000000000000000"},
+      {"02000000000000000000000000000000ffffffffffffffffffffffffffffffff", "02000000000000000000000000000000",
+       "03000000000000000000000000000000"},
+      {"0100000000000000000000000000000000000000000000000000000000000000",
+       "fffffffffffffffffffffffffffffffff0ffffffffffffffffffffffffffffff11000000000000000000000000000000",
+       "05000000000000000000000000000000"},
+      {"0100000000000000000000000000000000000000000000000000000000000000",
+       "fffffffffffffffffffffffffffffffffbfefefefefefefefefefefefefefefe01010101010101010101010101010101",
+       "00000000000000000000000000000000"},
+      {"0200000000000000000000000000000000000000000000000000000000000000", "fdffffffffffffffffffffffffffffff",
+       "faffffffffffffffffffffffffffffff"},
+      {"0100000000000000040000000000000000000000000000000000000000000000",
+       "e33594d7505e43b900000000000000003394d7505e4379cd0100000000000000000000000000000000000000000000000100000000"
+       "0000000000000000000000",
+       "14000000000000005500000000000000"},
+      {"0100000000000000040000000000000000000000000000000000000000000000",
+       "e33594d7505e43b900000000000000003394d7505e4379cd010000000000000000000000000000000000000000000000",
+       "13000000000000000000000000000000"},
+  };
+  for (const PolyEdge& e : kEdges) {
+    std::array<std::uint8_t, 32> ek{};
+    std::array<std::uint8_t, 64> em{};
+    fromHex(e.key, ek.data(), ek.size());
+    const std::size_t ml = fromHex(e.msg, em.data(), em.size());
+    Tag et{};
+    Poly1305 mac(ek.data());
+    mac.update(em.data(), ml);
+    mac.finish(et);
+    CHECK(equalsHex(et.data(), 16, e.tag));
+  }
+
+  // 2.8.2: AEAD.
+  Key ak{};
+  for (std::size_t i = 0; i < ak.size(); ++i) ak[i] = static_cast<std::uint8_t>(0x80 + i);
+  fromHex("070000004041424344454647", n.data(), n.size());
+  std::array<std::uint8_t, 12> aad{};
+  fromHex("50515253c0c1c2c3c4c5c6c7", aad.data(), aad.size());
+  Tag tag{};
+  aeadSeal(ak, n, aad.data(), aad.size(), pt, len, ct.data(), tag);
+  CHECK(equalsHex(ct.data(), len,
+                  "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d63dbea45e8ca9671282fafb69da92728b1a71"
+                  "de0a9e060b2905d6a5b67ecd3b3692ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc3ff4def0"
+                  "8e4b7a9de576d26586cec64b6116"));
+  CHECK(equalsHex(tag.data(), 16, "1ae10b594f09e26a7e902ecbd0600691"));
+  std::array<std::uint8_t, 128> back{};
+  CHECK(aeadOpen(ak, n, aad.data(), aad.size(), ct.data(), len, tag, back.data()));
+  CHECK(std::memcmp(back.data(), pt, len) == 0);
+
+  // Any changed bit in the ciphertext, the AAD or the tag is refused, and no plaintext leaks.
+  int forged = 0;
+  int leaked = 0;
+  for (std::size_t i = 0; i < len + aad.size() + tag.size(); ++i) {
+    std::array<std::uint8_t, 128> c2 = ct;
+    std::array<std::uint8_t, 12> a2 = aad;
+    Tag t3 = tag;
+    if (i < len) {
+      c2[i] ^= 0x01;
+    } else if (i < len + aad.size()) {
+      a2[i - len] ^= 0x80;
+    } else {
+      t3[i - len - aad.size()] ^= 0x10;
+    }
+    back.fill(0xEE);
+    if (aeadOpen(ak, n, a2.data(), a2.size(), c2.data(), len, t3, back.data())) ++forged;
+    for (std::size_t j = 0; j < len; ++j) leaked += back[j] != 0 ? 1 : 0;
+  }
+  CHECK(forged == 0);
+  CHECK(leaked == 0);
+
+  const std::uint8_t a[3] = {1, 2, 3};
+  const std::uint8_t b[3] = {1, 2, 4};
+  CHECK(constantTimeEqual(a, a, 3) && !constantTimeEqual(a, b, 3) && constantTimeEqual(a, b, 2));
+}
+
+#include "aead_vectors.inc"
+
+TEST(crypto_matches_an_independent_implementation) {
+  // Edge lengths around the 16- and 64-byte boundaries, cross-checked against OpenSSL.
+  int checked = 0;
+  for (const AeadVector& v : kAeadVectors) {
+    crypto::Key k{};
+    crypto::Nonce n{};
+    std::array<std::uint8_t, 64> aad{};
+    std::array<std::uint8_t, 160> pt{};
+    std::array<std::uint8_t, 192> want{};
+    fromHex(v.key, k.data(), k.size());
+    fromHex(v.nonce, n.data(), n.size());
+    const std::size_t aad_len = fromHex(v.aad, aad.data(), aad.size());
+    const std::size_t len = fromHex(v.pt, pt.data(), pt.size());
+    const std::size_t want_len = fromHex(v.ct_tag, want.data(), want.size());
+    CHECK(want_len == len + crypto::kTagBytes);
+    std::array<std::uint8_t, 160> ct{};
+    crypto::Tag tag{};
+    crypto::aeadSeal(k, n, aad.data(), aad_len, pt.data(), len, ct.data(), tag);
+    CHECK(std::memcmp(ct.data(), want.data(), len) == 0);
+    CHECK(std::memcmp(tag.data(), want.data() + len, crypto::kTagBytes) == 0);
+    std::array<std::uint8_t, 160> back{};
+    CHECK(crypto::aeadOpen(k, n, aad.data(), aad_len, ct.data(), len, tag, back.data()));
+    CHECK(std::memcmp(back.data(), pt.data(), len) == 0);
+    ++checked;
+  }
+  CHECK(checked == 11);
+}
+
+// Two drones' security layers sharing the pack key.
+struct SecPair {
+  MeshConfig cfg{};
+  MeshSecurity tx{7, 1, cfg};
+  MeshSecurity rx{3, 1, cfg};
+  TimeMs now = 1'700'000'000'000ULL;
+  SecPair() {
+    if (!tx.installEpochKey(kPackEpoch, kPackKey, 0, kNoExpiry) || !rx.installEpochKey(kPackEpoch, kPackKey, 0, kNoExpiry)) {
+      std::abort();
+    }
+  }
+  template <typename Payload>
+  std::size_t seal(const Payload& payload, std::array<std::uint8_t, kMaxPacketBytes>& buf, MeshSecurity* from = nullptr) {
+    MeshPacket p;
+    p.payload = payload;
+    return (from != nullptr ? *from : tx).seal(p, now, buf.data(), buf.size());
+  }
+};
+
+static DroneState sampleState(DroneId id) {
+  DroneState s;
+  s.id = id;
+  s.mode = DroneMode::VERIFYING;
+  s.active_sensor = SensorType::IR;
+  s.installed_sensors = maskOf(SensorType::IR) | maskOf(SensorType::RF_DF);
+  s.available_links = kLinkMaskAll;
+  s.position = GeoPoint{36.1234567, -11.7654321, 3123.5f};
+  s.speed_mps = 41.5f;
+  s.heading_deg = 77.0f;
+  s.endurance_remaining_s = 20000.0f;
+  s.bingo_endurance_s = 1800.0f;
+  s.tasked_event = 0x00070001u;
+  s.timestamp_ms = 1'700'000'123'400ULL;
+  return s;
+}
+
+TEST(frame_round_trip_all_types) {
+  auto sp = std::make_unique<SecPair>();
+  std::array<std::uint8_t, kMaxPacketBytes> buf{};
+  MeshPacket out;
+
+  const DroneState s = sampleState(7);
+  std::size_t n = sp->seal(HeartbeatPayload{s}, buf);
+  CHECK(n == kFrameHeaderBytes + kBodyHeaderBytes + 46 + kFrameTagBytes);
+  CHECK(sp->rx.open(buf.data(), n, sp->now, out) == OpenStatus::OK);
+  CHECK(out.type() == MsgType::HEARTBEAT);
+  CHECK(out.header.src == 7 && out.header.seq == 1 && out.header.session == 1 && out.header.epoch == kPackEpoch);
+  CHECK(out.header.time_ms == sp->now);
+  const auto* hb = std::get_if<HeartbeatPayload>(&out.payload);
+  CHECK(hb != nullptr);
+  if (hb != nullptr) {
+    CHECK(hb->state.mode == DroneMode::VERIFYING && hb->state.active_sensor == SensorType::IR);
+    CHECK(std::fabs(hb->state.position.lat_deg - 36.1234567) < 1e-7);
+    CHECK(std::fabs(hb->state.position.lon_deg + 11.7654321) < 1e-7);
+    CHECK(hb->state.endurance_remaining_s == 20000.0f && hb->state.tasked_event == 0x00070001u);
+    CHECK(hb->state.installed_sensors == s.installed_sensors && hb->state.available_links == kLinkMaskAll);
+  }
+  // The payload is not readable on the wire.
+  bool clear = false;
+  for (std::size_t i = kFrameHeaderBytes; i + 4 <= n; ++i) {
+    std::uint32_t v;
+    std::memcpy(&v, buf.data() + i, 4);
+    if (v == 0x00070001u) clear = true;
+  }
+  CHECK(!clear);
+
+  SensorObservation o = bearingObs(enu(0, 0), enu(5000, 5000), 0.0);
+  o.observer = 7;
+  o.event_hint = 0x00070001u;
+  o.observer_position = enu(0, 0);
+  o.timestamp_ms = 1'700'000'000'500ULL;
+  n = sp->seal(ObservationPayload{o}, buf);
+  CHECK(n == 104);  // the largest frame
+  CHECK(sp->rx.open(buf.data(), n, sp->now, out) == OpenStatus::OK);
+  const auto* ob = std::get_if<ObservationPayload>(&out.payload);
+  CHECK(ob != nullptr);
+  if (ob != nullptr) {
+    CHECK(ob->obs.observer == 7 && ob->obs.sensor == SensorType::RF_DF && !ob->obs.has_fix);
+    CHECK(ob->obs.signature == 406025u && ob->obs.event_hint == 0x00070001u);
+    CHECK(std::fabs(ob->obs.bearing_deg - o.bearing_deg) < 1e-3f);
+  }
+
+  n = sp->seal(TaskClaimPayload{0x00030001u, 7, 1, 0.77f}, buf);
+  CHECK(n > 0 && sp->rx.open(buf.data(), n, sp->now, out) == OpenStatus::OK);
+  const auto* tc = std::get_if<TaskClaimPayload>(&out.payload);
+  CHECK(tc != nullptr && tc->claimant == 7 && tc->role == 1 && tc->score == 0.77f);
+
+  n = sp->seal(AlertIssuedPayload{0x00030001u, AlertLevel::PRIORITY, 7}, buf);
+  CHECK(n > 0 && sp->rx.open(buf.data(), n, sp->now, out) == OpenStatus::OK);
+  const auto* ai = std::get_if<AlertIssuedPayload>(&out.payload);
+  CHECK(ai != nullptr && ai->level == AlertLevel::PRIORITY && ai->issuer == 7);
+
+  n = sp->seal(SignatureUpdatePayload{433920u}, buf);
+  CHECK(n > 0 && sp->rx.open(buf.data(), n, sp->now, out) == OpenStatus::OK);
+  const auto* su = std::get_if<SignatureUpdatePayload>(&out.payload);
+  CHECK(su != nullptr && su->signature == 433920u);
+
+  n = sp->seal(LeavePayload{}, buf);
+  CHECK(n == kFrameHeaderBytes + kBodyHeaderBytes + kFrameTagBytes);
+  CHECK(sp->rx.open(buf.data(), n, sp->now, out) == OpenStatus::OK && out.type() == MsgType::LEAVE);
+  CHECK(sp->tx.lastSeq() == 6);
+
+  // Our own frames come back on multicast loopback and are skipped, not counted as errors.
+  CHECK(sp->tx.open(buf.data(), n, sp->now, out) == OpenStatus::LOOPBACK);
+
+  // Output buffer too small: nothing sealed, no sequence number spent.
+  std::array<std::uint8_t, 40> tiny{};
+  MeshPacket p;
+  p.payload = HeartbeatPayload{s};
+  CHECK(sp->tx.seal(p, sp->now, tiny.data(), tiny.size()) == 0);
+  CHECK(sp->tx.lastSeq() == 6);
+}
+
+TEST(frame_rejects_corruption_and_bad_content) {
+  auto sp = std::make_unique<SecPair>();
+  std::array<std::uint8_t, kMaxPacketBytes> buf{};
+  MeshPacket out;
+  const std::size_t n = sp->seal(HeartbeatPayload{sampleState(7)}, buf);
+  CHECK(n > 0);
+
+  // Any single flipped byte, header or ciphertext or tag, is refused.
+  int accepted = 0;
+  for (std::size_t i = 0; i < n; ++i) {
+    std::array<std::uint8_t, kMaxPacketBytes> bad = buf;
+    bad[i] = static_cast<std::uint8_t>(bad[i] ^ 0x5A);
+    if (sp->rx.open(bad.data(), n, sp->now, out) == OpenStatus::OK) ++accepted;
+  }
+  CHECK(accepted == 0);
+  // Truncation, oversize, null.
+  for (std::size_t len = 0; len < n; ++len) CHECK(sp->rx.open(buf.data(), len, sp->now, out) == OpenStatus::MALFORMED);
+  CHECK(sp->rx.open(buf.data(), kMaxPacketBytes + 1, sp->now, out) == OpenStatus::MALFORMED);
+  CHECK(sp->rx.open(nullptr, 60, sp->now, out) == OpenStatus::MALFORMED);
+  // The untouched frame still opens after all that.
+  CHECK(sp->rx.open(buf.data(), n, sp->now, out) == OpenStatus::OK);
+
+  // A key holder can seal anything, so authentic frames are still validated:
+  // NaN, an out-of-range latitude, a heartbeat for another drone, an absurd claim score.
+  DroneState s = sampleState(7);
+  s.speed_mps = std::nanf("");
+  std::size_t k = sp->seal(HeartbeatPayload{s}, buf);
+  CHECK(k > 0 && sp->rx.open(buf.data(), k, sp->now, out) == OpenStatus::MALFORMED);
+  s = sampleState(7);
+  s.position.lat_deg = 91.0;
+  k = sp->seal(HeartbeatPayload{s}, buf);
+  CHECK(k > 0 && sp->rx.open(buf.data(), k, sp->now, out) == OpenStatus::MALFORMED);
+  k = sp->seal(HeartbeatPayload{sampleState(9)}, buf);
+  CHECK(k > 0 && sp->rx.open(buf.data(), k, sp->now, out) == OpenStatus::MALFORMED);
+  k = sp->seal(TaskClaimPayload{0x00070001u, 7, 0, 1.0e38f}, buf);
+  CHECK(k > 0 && sp->rx.open(buf.data(), k, sp->now, out) == OpenStatus::MALFORMED);
+}
+
+TEST(per_drone_keys_bind_the_sender) {
+  auto sp = std::make_unique<SecPair>();
+  std::array<std::uint8_t, kMaxPacketBytes> buf{};
+  MeshPacket out;
+  crypto::Key k7{};
+  crypto::Key k8{};
+  deriveDroneKey(kPackKey, kPackEpoch, 7, k7);
+  deriveDroneKey(kPackKey, kPackEpoch, 8, k8);
+  CHECK(k7 != k8 && k7 != kPackKey);
+
+  // Relabelling a frame as coming from another drone breaks it: the sender id
+  // picks the key and is authenticated as part of the header.
+  const std::size_t n = sp->seal(SignatureUpdatePayload{433920u}, buf);
+  std::array<std::uint8_t, kMaxPacketBytes> relabelled = buf;
+  relabelled[4] = 8;
+  CHECK(sp->rx.open(relabelled.data(), n, sp->now, out) == OpenStatus::AUTH_FAILED);
+
+  // An outsider with a different key for the same epoch number cannot speak.
+  MeshSecurity outsider(9, 1, sp->cfg);
+  CHECK(outsider.installEpochKey(kPackEpoch, testKey(77), 0, kNoExpiry));
+  const std::size_t m = sp->seal(SignatureUpdatePayload{433920u}, buf, &outsider);
+  CHECK(m > 0 && sp->rx.open(buf.data(), m, sp->now, out) == OpenStatus::AUTH_FAILED);
+  // A frame under an epoch the receiver does not hold.
+  MeshSecurity other_epoch(9, 1, sp->cfg);
+  CHECK(other_epoch.installEpochKey(42, kPackKey, 0, kNoExpiry));
+  const std::size_t e = sp->seal(SignatureUpdatePayload{433920u}, buf, &other_epoch);
+  CHECK(e > 0 && sp->rx.open(buf.data(), e, sp->now, out) == OpenStatus::NO_KEY);
+}
+
+TEST(replay_window_and_boot_sessions) {
+  auto sp = std::make_unique<SecPair>();
+  std::array<std::array<std::uint8_t, kMaxPacketBytes>, 72> f{};
+  std::array<std::size_t, 72> len{};
+  for (std::size_t i = 1; i < f.size(); ++i) len[i] = sp->seal(LeavePayload{}, f[i]);  // seq = i
+  MeshPacket out;
+  const auto open = [&](std::size_t i) { return sp->rx.open(f[i].data(), len[i], sp->now, out); };
+
+  CHECK(open(1) == OpenStatus::OK);
+  CHECK(open(1) == OpenStatus::REPLAYED);
+  CHECK(open(3) == OpenStatus::OK);
+  CHECK(open(2) == OpenStatus::OK);  // reordered within the window
+  CHECK(open(2) == OpenStatus::REPLAYED);
+  CHECK(open(70) == OpenStatus::OK);
+  CHECK(open(6) == OpenStatus::REPLAYED);  // 64 behind the newest: outside the window
+  CHECK(open(7) == OpenStatus::OK);        // 63 behind: still inside
+  CHECK(open(7) == OpenStatus::REPLAYED);
+
+  // The sender reboots with a higher session: accepted, and its old session is closed.
+  MeshSecurity rebooted(7, 2, sp->cfg);
+  CHECK(rebooted.installEpochKey(kPackEpoch, kPackKey, 0, kNoExpiry));
+  std::array<std::uint8_t, kMaxPacketBytes> r{};
+  const std::size_t rn = sp->seal(LeavePayload{}, r, &rebooted);
+  CHECK(sp->rx.open(r.data(), rn, sp->now, out) == OpenStatus::OK && out.header.session == 2 && out.header.seq == 1);
+  CHECK(open(71) == OpenStatus::REPLAYED);  // never seen, but from the older session
+
+  // Why the session must grow: a reboot that reuses session 2 reuses nonces,
+  // and its early frames are taken for replays.
+  MeshSecurity reused(7, 2, sp->cfg);
+  CHECK(reused.installEpochKey(kPackEpoch, kPackKey, 0, kNoExpiry));
+  const std::size_t un = sp->seal(LeavePayload{}, r, &reused);
+  CHECK(un > 0 && sp->rx.open(r.data(), un, sp->now, out) == OpenStatus::REPLAYED);
+}
+
+TEST(stale_and_future_frames_are_refused) {
+  auto sp = std::make_unique<SecPair>();
+  std::array<std::uint8_t, kMaxPacketBytes> buf{};
+  MeshPacket out;
+  const std::size_t n = sp->seal(LeavePayload{}, buf);
+  const TimeMs sent = sp->now;
+  CHECK(sp->rx.open(buf.data(), n, sent + sp->cfg.frame_max_age_ms + 1, out) == OpenStatus::STALE);
+  CHECK(sp->rx.open(buf.data(), n, sent - sp->cfg.max_clock_skew_ms - 1, out) == OpenStatus::STALE);
+  // A refused frame does not use up its place in the replay window.
+  CHECK(sp->rx.open(buf.data(), n, sent + 40, out) == OpenStatus::OK);
+}
+
+TEST(key_epoch_rollover_and_erase) {
+  MeshConfig cfg;
+  const TimeMs t = 1'700'000'000'000ULL;
+  const TimeMs rekey = t + 60'000;
+  MeshSecurity a(7, 1, cfg);
+  MeshSecurity b(3, 1, cfg);
+  for (MeshSecurity* s : {&a, &b}) {
+    CHECK(s->installEpochKey(1, kPackKey, 0, rekey + 30'000));  // old epoch overlaps the new by 30 s
+    CHECK(s->installEpochKey(2, testKey(2), rekey, kNoExpiry));
+  }
+  CHECK(!a.installEpochKey(3, testKey(3), t, t));  // empty window
+  std::uint16_t e = 0;
+  CHECK(a.sendEpoch(t, e) && e == 1);
+  CHECK(a.sendEpoch(rekey, e) && e == 2);
+
+  std::array<std::uint8_t, kMaxPacketBytes> old_frame{};
+  MeshPacket p;
+  p.payload = LeavePayload{};
+  const std::size_t on = a.seal(p, t, old_frame.data(), old_frame.size());
+  CHECK(on > 0 && p.header.epoch == 1);
+  MeshPacket out;
+  CHECK(b.open(old_frame.data(), on, t + 100, out) == OpenStatus::OK);
+
+  std::array<std::uint8_t, kMaxPacketBytes> new_frame{};
+  MeshPacket q;
+  q.payload = LeavePayload{};
+  const std::size_t nn = a.seal(q, rekey + 10, new_frame.data(), new_frame.size());
+  CHECK(nn > 0 && q.header.epoch == 2);
+  CHECK(b.open(new_frame.data(), nn, rekey + 20, out) == OpenStatus::OK);
+
+  // A frame under epoch 1, after epoch 1 and its grace have ended.
+  MeshSecurity late(7, 5, cfg);
+  CHECK(late.installEpochKey(1, kPackKey, 0, kNoExpiry));
+  const TimeMs after = rekey + 30'000 + cfg.key_epoch_grace_ms + 1;
+  std::array<std::uint8_t, kMaxPacketBytes> late_frame{};
+  MeshPacket r;
+  r.payload = LeavePayload{};
+  const std::size_t ln = late.seal(r, after, late_frame.data(), late_frame.size());
+  CHECK(ln > 0 && b.open(late_frame.data(), ln, after, out) == OpenStatus::NO_KEY);
+
+  // Erasing keys silences the sender; zeroizing empties every slot.
+  CHECK(a.eraseEpochKey(2) && !a.eraseEpochKey(2));
+  CHECK(!a.sendEpoch(rekey + 40'000, e));
+  CHECK(a.seal(q, rekey + 40'000, new_frame.data(), new_frame.size()) == 0);
+  b.zeroizeAll();
+  CHECK(b.epochCount() == 0);
+  CHECK(b.open(new_frame.data(), nn, rekey + 20, out) == OpenStatus::NO_KEY);
+}
+
+TEST(mesh_ignores_outsiders_replays_and_revoked_drones) {
+  auto p = std::make_unique<Pack>(4);
+  for (std::size_t i = 0; i < 3; ++i) p->place(i, 0, static_cast<double>(i) * 5000.0);
+  // Node 3 is an outsider: right frame format, wrong key.
+  p->mgr[3] = std::make_unique<PackMeshManager>(9, MeshConfig{}, 1U, p->clock, p->bus.nodes[3], p->gmcs[3], p->guidance[3]);
+  CHECK(p->mgr[3]->installEpochKey(kPackEpoch, testKey(66), 0, kNoExpiry));
+  p->place(3, 0, 15000);
+  p->bus.record_src = 1;  // record drone 2's traffic for a replay later
+  p->run(3000);
+  for (std::size_t i = 0; i < 3; ++i) {
+    CHECK(p->mgr[i]->table().peerCount() == 2);  // the outsider is never discovered
+    CHECK(p->mgr[i]->table().findPeer(9) == nullptr);
+    CHECK(p->mgr[i]->stats().rx_auth_failed > 0);
+  }
+  // The outsider's dismissal and alert notice change nothing.
+  p->mgr[3]->applyGmcsDismissal(433920u);
+  p->run(500);
+  for (std::size_t i = 0; i < 3; ++i) CHECK(!p->mgr[i]->table().isBenign(433920u));
+
+  // Replaying drone 2's recorded frames: refused at once as replays, later as stale.
+  p->bus.record_src = -1;
+  const std::size_t taped = p->bus.tape_n;
+  CHECK(taped >= 3);
+  const std::uint32_t replayed_before = p->mgr[0]->stats().rx_replayed;
+  for (std::size_t k = 0; k < taped; ++k) (void)p->bus.broadcastFrom(3, p->bus.tape[k].data.data(), p->bus.tape[k].len);
+  p->run(100);
+  CHECK(p->mgr[0]->stats().rx_replayed >= replayed_before + static_cast<std::uint32_t>(taped));
+  p->clock.now += 10'000;
+  const std::uint32_t stale_before = p->mgr[0]->stats().rx_stale;
+  for (std::size_t k = 0; k < taped; ++k) (void)p->bus.broadcastFrom(3, p->bus.tape[k].data.data(), p->bus.tape[k].len);
+  p->mgr[0]->tick();
+  CHECK(p->mgr[0]->stats().rx_stale >= stale_before + static_cast<std::uint32_t>(taped));
+
+  // Drone 3 reports a fix, then the GMCS revokes it: its readings are forgotten
+  // and its frames refused.
+  p->run(2000);
+  CHECK(p->mgr[2]->reportLocalDetection(fixObs(SensorType::IR, enu(9000, 0), 50.0f)));
+  p->run(1000);
+  CHECK(p->mgr[0]->table().events().size() == 1);
+  CHECK(p->mgr[0]->revokeDrone(3) && p->mgr[1]->revokeDrone(3));
+  CHECK(!p->mgr[0]->revokeDrone(1));  // not itself
+  p->run(2000);
+  for (std::size_t i = 0; i < 2; ++i) {
+    CHECK(p->mgr[i]->table().events().empty());
+    CHECK(p->mgr[i]->table().findPeer(3) == nullptr);
+    CHECK(p->mgr[i]->stats().rx_revoked > 0);
+  }
+}
+
+TEST(no_key_means_silence_and_reboot_is_accepted) {
+  auto p = std::make_unique<Pack>(2);
+  p->place(0, 0, 0);
+  p->place(1, 0, 5000);
+  p->run(2000);
+  CHECK(p->mgr[0]->table().peerCount() == 1);
+  // Drone 2 reboots with a new session and comes straight back.
+  p->reboot(1, 2);
+  p->place(1, 0, 5000);
+  p->run(2000);
+  CHECK(p->mgr[0]->table().peerCount() == 1);
+  CHECK(p->mgr[0]->stats().rx_replayed == 0);
+  const PeerRecord* r = p->mgr[0]->table().findPeer(2);
+  CHECK(r != nullptr && r->last_session == 2);
+  // Keys zeroized: nothing goes out, and the peer times the drone out.
+  p->mgr[1]->zeroizeKeys();
+  const std::uint32_t tx = p->mgr[1]->stats().tx_packets;
+  p->run(7000);
+  CHECK(p->mgr[1]->stats().tx_packets == tx);
+  CHECK(p->mgr[1]->stats().tx_no_key > 0);
+  CHECK(p->mgr[0]->table().peerCount() == 0);
+}
+
 // ------------------------------------------- regressions from code review
 
 static SensorObservation tableObs(SensorObservation o, DroneId observer, TimeMs ts, EventId hint = kNoEvent) {
@@ -1140,34 +1569,33 @@ TEST(packets_that_speak_for_someone_else_are_rejected) {
   p->place(0, 0, 0);
   p->place(1, 0, 5000);
   p->run(2000);
+  // Drone 7 holds the pack key (an insider) but has never been heard ...
+  MeshSecurity insider(7, 1, MeshConfig{});
+  CHECK(insider.installEpochKey(kPackEpoch, kPackKey, 0, kNoExpiry));
   std::array<std::uint8_t, kMaxPacketBytes> buf{};
+  const auto send = [&](const MeshPacket& in) {
+    MeshPacket pkt = in;
+    const std::size_t n = insider.seal(pkt, p->clock.now, buf.data(), buf.size());
+    CHECK(n > 0);
+    CHECK(p->bus.broadcastFrom(1, buf.data(), n));
+  };
   MeshPacket pkt;
-  pkt.header = PacketHeader{7, 1, p->clock.now};  // never-heard sender ...
   SensorObservation o = fixObs(SensorType::IR, enu(9000, 0), 50.0f);
-  o.observer = 1;  // ... claiming to relay drone 1's own reading
+  o.observer = 1;  // ... and claims to relay drone 1's own reading,
   o.observer_position = enu(0, 0);
   o.timestamp_ms = p->clock.now;
   pkt.payload = ObservationPayload{o};
-  std::size_t n = encodePacket(pkt, buf.data(), buf.size());
-  CHECK(n > 0);
-  CHECK(p->bus.broadcastFrom(1, buf.data(), n));
-  // A claim and an alert notice in someone else's name.
-  pkt.payload = TaskClaimPayload{0x00020001u, 2, 0, 0.9f};
-  n = encodePacket(pkt, buf.data(), buf.size());
-  CHECK(p->bus.broadcastFrom(1, buf.data(), n));
-  pkt.payload = AlertIssuedPayload{0x00020001u, AlertLevel::PRIORITY, 2};
-  n = encodePacket(pkt, buf.data(), buf.size());
-  CHECK(p->bus.broadcastFrom(1, buf.data(), n));
+  send(pkt);
+  pkt.payload = TaskClaimPayload{0x00020001u, 2, 0, 0.9f};  // a claim in drone 2's name,
+  send(pkt);
+  pkt.payload = AlertIssuedPayload{0x00020001u, AlertLevel::PRIORITY, 2};  // and an alert notice in it.
+  send(pkt);
+  pkt.payload = TaskClaimPayload{0x00070001u, 7, 0, 1.0e38f};  // An absurd claim score.
+  send(pkt);
   p->run(300);
   CHECK(p->mgr[0]->table().events().empty());
-  CHECK(p->mgr[0]->stats().rx_rejected >= 3);
-
-  // An absurd claim score never even decodes.
-  pkt.header.src = 2;
-  pkt.payload = TaskClaimPayload{0x00020001u, 2, 0, 1.0e38f};
-  n = encodePacket(pkt, buf.data(), buf.size());
-  MeshPacket out;
-  CHECK(n > 0 && !decodePacket(buf.data(), n, out));
+  CHECK(p->mgr[0]->stats().rx_rejected >= 4);
+  CHECK(p->mgr[0]->stats().rx_auth_failed == 0);  // they were authentic; the content was refused
 }
 
 TEST(future_and_expired_timestamps_are_rejected) {
@@ -1183,7 +1611,7 @@ TEST(future_and_expired_timestamps_are_rejected) {
   s.installed_sensors = maskOf(SensorType::IR);
   s.position = enu(0, 0);
   s.timestamp_ms = now + 3'600'000;
-  CHECK(!t.updatePeer(s, 1, now));
+  CHECK(!t.updatePeer(s, 1, 1, now));
   CHECK(t.peerCount() == 0);
 }
 
@@ -1215,7 +1643,7 @@ TEST(full_pack_fits_the_snapshot) {
     s.installed_sensors = maskOf(SensorType::IR);
     s.position = enu(0, 1000.0 * id);
     s.timestamp_ms = now;
-    const bool added = t.updatePeer(s, 1, now);
+    const bool added = t.updatePeer(s, 1, 1, now);
     CHECK(added == (id <= kMaxPackSize));  // 15 peers + self = the full pack
   }
   DroneList dl;

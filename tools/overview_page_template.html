@@ -405,13 +405,14 @@ PRIORITY:  confidence >= 0.9, CEP <= 250 m,
     <h2>Not done yet</h2>
     <p class="intro">Read these before relying on any of this.</p>
     <ul class="open">
-      <li><b>No authentication or encryption.</b><span>Packets carry a CRC, which catches accidents but not an attacker. A real mesh needs authenticated encryption, key management and replay protection.</span></li>
+      <li><b>The cipher is not a validated module.</b><span>Frames are sealed with ChaCha20-Poly1305, implemented from RFC 8439 and vector-tested. A fielded system needs a validated module behind the same interface.</span></li>
+      <li><b>Insiders can forge within an epoch.</b><span>Keys are symmetric. A captured drone can forge frames in any member's name until the GMCS revokes it and re-keys the pack without it.</span></li>
       <li><b>No flight validation.</b><span>Every performance figure comes from a simulation with idealised sensors, zero radio latency and a range limited only by distance.</span></li>
       <li><b>The 8270's real interfaces are assumed.</b><span>All hardware access goes through one abstraction layer. The buses in the diagram are recommendations.</span></li>
       <li><b>The FCS interface has no reply.</b><span>A real one needs accept and refuse.</span></li>
       <li><b>Time assumes a shared GNSS-disciplined clock.</b><span>GNSS-denied operation is not handled.</span></li>
       <li><b>The corridor is a circle.</b><span>A real approved corridor is a polygon.</span></li>
-      <li><b>Forged packets.</b><span>Packets naming another drone as sender, future timestamps and absurd values are rejected, but a forged frequency dismissal or alert notice still works without authentication.</span></li>
+      <li><b>A pack member can still lie in its own name.</b><span>Authentication proves who sent a frame, not that it is true. Content checks limit the damage and revocation removes the drone.</span></li>
       <li><b>Mesh partitions are untested.</b><span>Each side of a split keeps working by design and the GMCS de-duplicates alerts, but no test covers it.</span></li>
     </ul>
     <footer>

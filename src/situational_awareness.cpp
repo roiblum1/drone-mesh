@@ -88,22 +88,23 @@ constexpr double kUngatedMetric = 1.0e12;  // ranks signature-only matches after
 
 std::int64_t quantiseScore(float s) noexcept { return std::llround(static_cast<double>(s) * 1.0e4); }
 
-constexpr std::uint32_t kSeqRestartWindow = 1000U;  // a jump larger than this is a restart, not loss
+constexpr std::uint32_t kMaxCountedGap = 1000U;  // a larger gap would wreck the loss statistic
 
-bool trackSeq(PeerRecord& p, std::uint32_t seq) noexcept {
-  if (seq > p.last_seq) {
-    const std::uint32_t gap = seq - p.last_seq - 1U;
-    if (gap <= kSeqRestartWindow) p.missed_count += gap;  // huge jumps would wreck the statistic
+// Sequence numbers restart with each boot session (the security layer has
+// already rejected duplicates, replays and older sessions).
+bool trackSeq(PeerRecord& p, std::uint32_t session, std::uint32_t seq) noexcept {
+  if (session != p.last_session) {
+    p.last_session = session;
     p.last_seq = seq;
     ++p.rx_count;
     return true;
   }
-  if (p.last_seq - seq > kSeqRestartWindow) {  // sender restarted
-    p.last_seq = seq;
-    ++p.rx_count;
-    return true;
-  }
-  return false;  // duplicate or reordered
+  if (seq <= p.last_seq) return false;  // reordered
+  const std::uint32_t gap = seq - p.last_seq - 1U;
+  if (gap <= kMaxCountedGap) p.missed_count += gap;
+  p.last_seq = seq;
+  ++p.rx_count;
+  return true;
 }
 
 }  // namespace
@@ -228,29 +229,31 @@ void SituationalAwarenessTable::setSelf(const DroneState& st) noexcept {
   self_.id = self_id_;
 }
 
-bool SituationalAwarenessTable::updatePeer(const DroneState& st, std::uint32_t seq, TimeMs now) noexcept {
+bool SituationalAwarenessTable::updatePeer(const DroneState& st, std::uint32_t session, std::uint32_t seq,
+                                           TimeMs now) noexcept {
   if (st.id == kNoDrone || st.id == self_id_ || !isPlausible(st)) return false;
   if (st.timestamp_ms > now + cfg_.max_clock_skew_ms) return false;
   for (auto& p : peers_) {
     if (p.state.id != st.id) continue;
     p.last_heard_ms = now;
-    if (trackSeq(p, seq) || st.timestamp_ms > p.state.timestamp_ms) p.state = st;
+    if (trackSeq(p, session, seq) || st.timestamp_ms > p.state.timestamp_ms) p.state = st;
     return false;
   }
   if (peers_.full()) return false;
   PeerRecord r;
   r.state = st;
   r.last_heard_ms = now;
+  r.last_session = session;
   r.last_seq = seq;
   r.rx_count = 1;
   return peers_.push_back(r);
 }
 
-void SituationalAwarenessTable::notePacket(DroneId src, std::uint32_t seq, TimeMs now) noexcept {
+void SituationalAwarenessTable::notePacket(DroneId src, std::uint32_t session, std::uint32_t seq, TimeMs now) noexcept {
   for (auto& p : peers_) {
     if (p.state.id != src) continue;
     p.last_heard_ms = now;
-    trackSeq(p, seq);
+    (void)trackSeq(p, session, seq);
     return;
   }
 }
@@ -576,6 +579,23 @@ void SituationalAwarenessTable::refresh(TimeMs now) noexcept {
       ev.status = ev.localized ? EventStatus::LOCALIZED : EventStatus::CANDIDATE;
     }
   }
+}
+
+std::size_t SituationalAwarenessTable::purgeObserver(DroneId observer) noexcept {
+  std::size_t removed = 0;
+  for (auto& ev : events_) {
+    for (std::size_t j = ev.observations.size(); j-- > 0;) {
+      if (ev.observations[j].observer == observer) {
+        ev.observations.erase_at(j);
+        ++removed;
+      }
+    }
+    for (auto& slot : ev.verifier) {
+      if (slot.id == observer) slot = VerifierSlot{};
+    }
+    fuseEvent(ev, cfg_);
+  }
+  return removed;
 }
 
 ClaimResult SituationalAwarenessTable::applyClaim(EventId event, DroneId claimant, std::uint8_t role, float score,

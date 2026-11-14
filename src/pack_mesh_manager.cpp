@@ -18,9 +18,16 @@ LinkType pickLink(LinkMask m) noexcept {
 
 }  // namespace
 
-PackMeshManager::PackMeshManager(DroneId self, const MeshConfig& cfg, IClock& clock, IMeshTransceiver& radio,
-                                 IGmcsLink& gmcs, IGuidanceSink& guidance) noexcept
-    : self_(self), cfg_(cfg), clock_(clock), radio_(radio), gmcs_(gmcs), guidance_(guidance), table_(self, cfg) {
+PackMeshManager::PackMeshManager(DroneId self, const MeshConfig& cfg, std::uint32_t boot_session, IClock& clock,
+                                 IMeshTransceiver& radio, IGmcsLink& gmcs, IGuidanceSink& guidance) noexcept
+    : self_(self),
+      cfg_(cfg),
+      clock_(clock),
+      radio_(radio),
+      gmcs_(gmcs),
+      guidance_(guidance),
+      security_(self, boot_session, cfg),
+      table_(self, cfg) {
   own_.id = self;
   // Seed event ids from boot time so ids handed out before a restart are not reused.
   table_.seedEventCounter(static_cast<std::uint16_t>((clock_.nowMs() / 1000U) & 0xFFFFU));
@@ -88,6 +95,22 @@ void PackMeshManager::addKnownBenignSignature(std::uint32_t signature) noexcept 
   (void)table_.markBenign(signature, false);  // false just means it was already known
 }
 
+bool PackMeshManager::installEpochKey(std::uint16_t epoch, const crypto::Key& key, TimeMs valid_from_ms,
+                                      TimeMs valid_until_ms) noexcept {
+  return security_.installEpochKey(epoch, key, valid_from_ms, valid_until_ms);
+}
+
+bool PackMeshManager::eraseEpochKey(std::uint16_t epoch) noexcept { return security_.eraseEpochKey(epoch); }
+
+void PackMeshManager::zeroizeKeys() noexcept { security_.zeroizeAll(); }
+
+bool PackMeshManager::revokeDrone(DroneId id) noexcept {
+  if (!security_.revokeDrone(id)) return false;
+  if (table_.removePeer(id)) ++stats_.peers_lost;
+  (void)table_.purgeObserver(id);
+  return true;
+}
+
 void PackMeshManager::shutdown() noexcept {
   cancelTask(true);
   (void)broadcast(LeavePayload{}, clock_.nowMs());
@@ -98,13 +121,14 @@ void PackMeshManager::shutdown() noexcept {
 template <typename Payload>
 bool PackMeshManager::broadcast(const Payload& payload, TimeMs now) noexcept {
   MeshPacket p;
-  p.header.src = self_;
-  p.header.seq = ++seq_;
-  p.header.time_ms = now;
   p.payload = payload;
   std::array<std::uint8_t, kMaxPacketBytes> buf;
-  const std::size_t n = encodePacket(p, buf.data(), buf.size());
-  if (n == 0 || !radio_.send(buf.data(), n)) return false;
+  const std::size_t n = security_.seal(p, now, buf.data(), buf.size());
+  if (n == 0) {
+    ++stats_.tx_no_key;  // the only way seal() fails for a well-formed payload
+    return false;
+  }
+  if (!radio_.send(buf.data(), n)) return false;
   ++stats_.tx_packets;
   return true;
 }
@@ -115,27 +139,47 @@ void PackMeshManager::receiveAll(TimeMs now) noexcept {
     const std::size_t n = radio_.receive(buf.data(), buf.size());
     if (n == 0) break;
     MeshPacket pkt;
-    if (!decodePacket(buf.data(), n, pkt)) {
-      ++stats_.rx_rejected;
-      continue;
+    switch (security_.open(buf.data(), n, now, pkt)) {
+      case OpenStatus::OK:
+        ++stats_.rx_packets;
+        handlePacket(pkt, now);
+        break;
+      case OpenStatus::LOOPBACK:
+        break;
+      case OpenStatus::MALFORMED:
+        ++stats_.rx_rejected;
+        break;
+      case OpenStatus::NO_KEY:
+        ++stats_.rx_no_key;
+        break;
+      case OpenStatus::AUTH_FAILED:
+        ++stats_.rx_auth_failed;
+        break;
+      case OpenStatus::REVOKED:
+        ++stats_.rx_revoked;
+        break;
+      case OpenStatus::STALE:
+        ++stats_.rx_stale;
+        break;
+      case OpenStatus::REPLAYED:
+        ++stats_.rx_replayed;
+        break;
     }
-    ++stats_.rx_packets;
-    handlePacket(pkt, now);
   }
 }
 
 void PackMeshManager::handlePacket(const MeshPacket& pkt, TimeMs now) noexcept {
-  if (pkt.header.src == self_) return;  // multicast loopback
+  if (pkt.header.src == self_) return;  // multicast loopback (already filtered by the security layer)
 
   if (const auto* hb = std::get_if<HeartbeatPayload>(&pkt.payload)) {
-    if (table_.updatePeer(hb->state, pkt.header.seq, now)) ++stats_.peers_discovered;
+    if (table_.updatePeer(hb->state, pkt.header.session, pkt.header.seq, now)) ++stats_.peers_discovered;
     return;
   }
-  table_.notePacket(pkt.header.src, pkt.header.seq, now);
+  table_.notePacket(pkt.header.src, pkt.header.session, pkt.header.seq, now);
 
   // A drone only speaks for itself: it relays nothing, so the named observer,
-  // claimant or issuer must be the sender. (Without message authentication
-  // this stops accidents and naive spoofing, not a determined attacker.)
+  // claimant or issuer must be the sender. The sender itself is authenticated:
+  // the frame verified under that drone's own key for the epoch.
   if (const auto* ob = std::get_if<ObservationPayload>(&pkt.payload)) {
     if (ob->obs.observer != pkt.header.src) {
       ++stats_.rx_rejected;

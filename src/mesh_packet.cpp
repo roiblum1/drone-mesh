@@ -10,17 +10,6 @@ namespace amc8270::mesh {
 
 namespace {
 
-constexpr std::array<std::uint32_t, 256> makeCrcTable() {
-  std::array<std::uint32_t, 256> t{};
-  for (std::uint32_t i = 0; i < 256; ++i) {
-    std::uint32_t c = i;
-    for (int k = 0; k < 8; ++k) c = ((c & 1U) != 0U) ? (0xEDB88320U ^ (c >> 1U)) : (c >> 1U);
-    t[i] = c;
-  }
-  return t;
-}
-constexpr std::array<std::uint32_t, 256> kCrcTable = makeCrcTable();
-
 constexpr double kGeoScale = 1.0e7;  // 1e-7 deg ~ 1.1 cm
 
 class Writer {
@@ -133,7 +122,7 @@ class Reader {
   bool ok_ = true;
 };
 
-// ---- payload encoders
+// ---- payload codecs
 
 void writeState(Writer& w, const DroneState& s) {
   w.u16(s.id);
@@ -217,90 +206,85 @@ void readObservation(Reader& r, SensorObservation& o) {
 
 }  // namespace
 
-std::uint32_t crc32(const std::uint8_t* data, std::size_t len) noexcept {
-  std::uint32_t c = 0xFFFFFFFFu;
-  for (std::size_t i = 0; i < len; ++i) c = kCrcTable[(c ^ data[i]) & 0xFFU] ^ (c >> 8U);
-  return c ^ 0xFFFFFFFFu;
+void writeFrameHeader(const FrameHeader& h, std::uint8_t* out18) noexcept {
+  Writer w(out18, kFrameHeaderBytes);
+  w.u16(kPacketMagic);
+  w.u8(kPacketVersion);
+  w.u8(0);  // flags, reserved
+  w.u16(h.src);
+  w.u16(h.epoch);
+  w.u32(h.session);
+  w.u32(h.seq);
+  w.u16(h.body_len);
 }
 
-std::size_t encodePacket(const MeshPacket& pkt, std::uint8_t* buf, std::size_t cap) noexcept {
-  if (buf == nullptr || pkt.payload.index() == 0 || cap < kHeaderBytes + kCrcBytes) return 0;
+bool parseFrameHeader(const std::uint8_t* buf, std::size_t len, FrameHeader& out) noexcept {
+  if (buf == nullptr || len < kFrameHeaderBytes + kBodyHeaderBytes + kFrameTagBytes || len > kMaxPacketBytes) {
+    return false;
+  }
+  Reader r(buf, kFrameHeaderBytes);
+  const std::uint16_t magic = r.u16();
+  const std::uint8_t version = r.u8();
+  const std::uint8_t flags = r.u8();
+  out.src = r.u16();
+  out.epoch = r.u16();
+  out.session = r.u32();
+  out.seq = r.u32();
+  out.body_len = r.u16();
+  if (!r.ok() || magic != kPacketMagic || version != kPacketVersion || flags != 0) return false;
+  if (out.src == kNoDrone || out.session == 0 || out.seq == 0) return false;
+  return static_cast<std::size_t>(out.body_len) + kFrameHeaderBytes + kFrameTagBytes == len;
+}
 
-  // Payload first (after the header), then back-fill length.
-  Writer body(buf + kHeaderBytes, cap - kHeaderBytes - kCrcBytes);
+std::size_t encodeBody(const MeshPacket& pkt, std::uint8_t* buf, std::size_t cap) noexcept {
+  if (buf == nullptr || pkt.payload.index() == 0) return 0;
+  Writer w(buf, cap);
+  w.u8(static_cast<std::uint8_t>(pkt.type()));
+  w.u64(pkt.header.time_ms);
   switch (pkt.type()) {
     case MsgType::HEARTBEAT:
-      writeState(body, std::get_if<HeartbeatPayload>(&pkt.payload)->state);
+      writeState(w, std::get_if<HeartbeatPayload>(&pkt.payload)->state);
       break;
     case MsgType::OBSERVATION:
-      writeObservation(body, std::get_if<ObservationPayload>(&pkt.payload)->obs);
+      writeObservation(w, std::get_if<ObservationPayload>(&pkt.payload)->obs);
       break;
     case MsgType::TASK_CLAIM: {
       const auto* p = std::get_if<TaskClaimPayload>(&pkt.payload);
-      body.u32(p->event_id);
-      body.u16(p->claimant);
-      body.u8(p->role);
-      body.f32(p->score);
+      w.u32(p->event_id);
+      w.u16(p->claimant);
+      w.u8(p->role);
+      w.f32(p->score);
       break;
     }
     case MsgType::ALERT_ISSUED: {
       const auto* p = std::get_if<AlertIssuedPayload>(&pkt.payload);
-      body.u32(p->event_id);
-      body.u8(static_cast<std::uint8_t>(p->level));
-      body.u16(p->issuer);
+      w.u32(p->event_id);
+      w.u8(static_cast<std::uint8_t>(p->level));
+      w.u16(p->issuer);
       break;
     }
     case MsgType::SIGNATURE_UPDATE:
-      body.u32(std::get_if<SignatureUpdatePayload>(&pkt.payload)->signature);
+      w.u32(std::get_if<SignatureUpdatePayload>(&pkt.payload)->signature);
       break;
     case MsgType::LEAVE:
       break;
   }
-  if (!body.ok()) return 0;
-  const std::size_t payload_len = body.size();
-
-  Writer head(buf, kHeaderBytes);
-  head.u16(kPacketMagic);
-  head.u8(kPacketVersion);
-  head.u8(static_cast<std::uint8_t>(pkt.type()));
-  head.u16(pkt.header.src);
-  head.u16(static_cast<std::uint16_t>(payload_len));
-  head.u32(pkt.header.seq);
-  head.u64(pkt.header.time_ms);
-  if (!head.ok()) return 0;
-
-  const std::uint32_t crc = crc32(buf, kHeaderBytes + payload_len);
-  Writer tail(buf + kHeaderBytes + payload_len, kCrcBytes);
-  tail.u32(crc);
-  return kHeaderBytes + payload_len + kCrcBytes;
+  return w.ok() ? w.size() : 0;
 }
 
-bool decodePacket(const std::uint8_t* buf, std::size_t len, MeshPacket& out) noexcept {
-  if (buf == nullptr || len < kHeaderBytes + kCrcBytes || len > kMaxPacketBytes) return false;
+bool decodeBody(const std::uint8_t* buf, std::size_t len, DroneId src, MeshPacket& out) noexcept {
+  if (buf == nullptr || len < kBodyHeaderBytes || len > kMaxBodyBytes || src == kNoDrone) return false;
+  Reader r(buf, len);
+  const std::uint8_t type = r.u8();
+  out.header.src = src;
+  out.header.time_ms = r.u64();
+  if (!r.ok() || type < 1 || type > kMsgTypeMax) return false;
 
-  Reader head(buf, kHeaderBytes);
-  const std::uint16_t magic = head.u16();
-  const std::uint8_t version = head.u8();
-  const std::uint8_t type = head.u8();
-  PacketHeader h;
-  h.src = head.u16();
-  const std::uint16_t payload_len = head.u16();
-  h.seq = head.u32();
-  h.time_ms = head.u64();
-  if (!head.ok() || magic != kPacketMagic || version != kPacketVersion || h.src == kNoDrone) return false;
-  if (type < 1 || type > kMsgTypeMax) return false;
-  if (static_cast<std::size_t>(payload_len) + kHeaderBytes + kCrcBytes != len) return false;
-
-  Reader tail(buf + kHeaderBytes + payload_len, kCrcBytes);
-  if (tail.u32() != crc32(buf, kHeaderBytes + payload_len)) return false;
-
-  Reader r(buf + kHeaderBytes, payload_len);
-  out.header = h;
   switch (static_cast<MsgType>(type)) {
     case MsgType::HEARTBEAT: {
       auto& p = out.payload.emplace<HeartbeatPayload>();
       readState(r, p.state);
-      if (p.state.id != h.src) return false;
+      if (p.state.id != src) return false;  // a drone only describes itself
       break;
     }
     case MsgType::OBSERVATION: {
@@ -324,8 +308,7 @@ bool decodePacket(const std::uint8_t* buf, std::size_t len, MeshPacket& out) noe
       p.event_id = r.u32();
       const std::uint8_t level = r.u8();
       p.issuer = r.u16();
-      if (p.issuer == kNoDrone) return false;
-      if (level == 0 || level > kAlertLevelMax || p.event_id == kNoEvent) return false;
+      if (p.issuer == kNoDrone || level == 0 || level > kAlertLevelMax || p.event_id == kNoEvent) return false;
       p.level = static_cast<AlertLevel>(level);
       break;
     }

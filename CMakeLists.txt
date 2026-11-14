@@ -1,5 +1,4 @@
-# NOT VERIFIED: cmake was not installed where this repo was built. The Makefile is the
-# tested build; this file mirrors its flags and targets.
+# Mirrors the Makefile's flags and targets. The Makefile is the primary build.
 cmake_minimum_required(VERSION 3.16)
 project(amc8270_mesh LANGUAGES CXX)
 
@@ -9,8 +8,10 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_library(amc8270_mesh STATIC
   src/coordination.cpp
+  src/crypto.cpp
   src/geo.cpp
   src/mesh_packet.cpp
+  src/mesh_security.cpp
   src/pack_mesh_manager.cpp
   src/situational_awareness.cpp
   src/validation.cpp)

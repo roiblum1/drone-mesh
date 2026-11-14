@@ -41,7 +41,7 @@ bool isPlausibleClaimScore(float score) noexcept { return inRange(score, 0.0f, k
 bool isValid(const MeshConfig& c) noexcept {
   const bool periods = c.heartbeat_period_ms > 0 && c.peer_timeout_ms > c.heartbeat_period_ms &&
                        c.anti_entropy_period_ms > 0 && c.coordination_period_ms > 0 &&
-                       c.observation_max_age_ms > 0 && c.max_antientropy_per_cycle > 0;
+                       c.observation_max_age_ms > 0 && c.max_antientropy_per_cycle > 0 && c.frame_max_age_ms > 0;
   const bool divisors = c.urgency_decay_ms > 0.0 && c.eta_ref_s > 0.0 && c.fuel_ref_s > 0.0 && c.min_speed_mps > 0.0;
   const bool fractions = c.max_diversion_fraction >= 0.0 && c.max_diversion_fraction <= 1.0 &&
                          c.benign_novelty >= 0.0 && c.benign_novelty <= 1.0 &&

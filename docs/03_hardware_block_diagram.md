@@ -133,9 +133,9 @@ I7 to I10 together form the **Variable Homing Devices bus**: the payload interfa
 
 | ID | Link | Bus | Rate (recommended) | Content | Notes |
 |---|---|---|---|---|---|
-| I1 | Mesh Network Transceiver ↔ AMC | Gigabit Ethernet, UDP multicast | Offered load 2–4 kbit/s per drone (simulated); radio capacity ≥ 1 Mbit/s shared | `MeshPacket` frames, ≤ 160 B | Own VLAN. The software caps frames at 160 B |
+| I1 | Mesh Network Transceiver ↔ AMC | Gigabit Ethernet, UDP multicast | Offered load 2–4 kbit/s per drone (simulated); radio capacity ≥ 1 Mbit/s shared | `MeshPacket` frames, ≤ 160 B (≤ 104 B in use), authenticated and encrypted with ChaCha20-Poly1305 | Own VLAN. The software caps frames at 160 B |
 | I2 | AMC time service → Mesh Network Transceiver | 1 PPS, RS-422 differential | 1 Hz | Time pulse for the radio's slot timing | Optional if the radio is CSMA-based |
-| I3 | Mesh Network Transceiver management | RS-422 or Ethernet management | 38.4–115.2 kbaud | Frequency, power, link statistics, emergency key zeroize | |
+| I3 | Mesh Network Transceiver management | RS-422 or Ethernet management | 38.4–115.2 kbaud | Frequency, power, link statistics, emergency key zeroize | The radio's own link keys are separate from the mesh epoch keys the AMC holds |
 | I4 | LOS, LEO, GEO terminals ↔ AMC | Gigabit Ethernet | ≥ 10 Mbit/s each, 1 Gbit/s ports | Alerts, mission data, downlinked imagery | One VLAN per terminal |
 | I5 | C2 terminals → FCS | RS-422, dual | 115.2–460.8 kbaud | **Flight commands, direct, not via AMC** | Rule 1 above |
 | I6 | AMC ↔ C2 terminals (M&C) | RS-422 / RS-485 | 38.4–115.2 kbaud | Link state, antenna control, selecting the active link | Feeds `available_links` in `DroneState` |
@@ -167,4 +167,5 @@ I7 to I10 together form the **Variable Homing Devices bus**: the payload interfa
 - **Mesh jammed or out of range:** each drone keeps working from its own table; the pack degrades to independent drones, which is today's baseline.
 - **C2 link lost:** alerts queue and go out on whichever link comes back; any drone with a link can send them.
 - **Homing device brown-out:** a device on the Variable Homing Devices bus that loses power is dropped from `installed_sensors`; the drone stays in the pack and keeps sharing what its other devices see.
+- **Drone captured:** the GMCS revokes it on the other drones and re-keys the pack without it; the AMC's `zeroizeKeys()` erases its own epoch keys on command.
 - **Bad FCS state data:** the AMC refuses to nominate a drone whose `DroneState` fails validation (range, finiteness).

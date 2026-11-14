@@ -41,6 +41,15 @@ struct MeshConfig {
   // a far-future stamp would otherwise never age out and could never be replaced.
   std::uint32_t max_clock_skew_ms = 2000;
 
+  // ---- mesh security (mesh_security.hpp)
+  // An authentic frame sent longer ago than this is refused. It bounds how long
+  // a recorded frame could be replayed to a drone that holds no replay-window
+  // state for its sender yet, e.g. just after it boots.
+  std::uint32_t frame_max_age_ms = 5000;
+  // A key epoch is accepted this long before it starts and after it ends, so
+  // frames in flight across a re-key are not lost.
+  std::uint32_t key_epoch_grace_ms = 10000;
+
   // ---- association and fusion
   double association_gate_m = 500.0;
   double association_cep_factor = 1.5;

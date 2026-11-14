@@ -16,6 +16,7 @@ namespace amc8270::mesh {
 struct PeerRecord {
   DroneState state{};
   TimeMs last_heard_ms = 0;
+  std::uint32_t last_session = 0;  // sender's boot session (a new one restarts seq)
   std::uint32_t last_seq = 0;
   std::uint32_t rx_count = 0;
   std::uint32_t missed_count = 0;  // sequence gaps = packets lost on the mesh
@@ -44,9 +45,9 @@ class SituationalAwarenessTable {
   void setSelf(const DroneState& st) noexcept;
   const DroneState& self() const noexcept { return self_; }
   // Creates or updates a peer from a HEARTBEAT. True if newly discovered.
-  [[nodiscard]] bool updatePeer(const DroneState& st, std::uint32_t seq, TimeMs now) noexcept;
+  [[nodiscard]] bool updatePeer(const DroneState& st, std::uint32_t session, std::uint32_t seq, TimeMs now) noexcept;
   // Liveness + loss accounting for any other packet from a known peer.
-  void notePacket(DroneId src, std::uint32_t seq, TimeMs now) noexcept;
+  void notePacket(DroneId src, std::uint32_t session, std::uint32_t seq, TimeMs now) noexcept;
   std::size_t expirePeers(TimeMs now) noexcept;  // returns how many were dropped
   bool removePeer(DroneId id) noexcept;
   const PeerRecord* findPeer(DroneId id) const noexcept;
@@ -73,6 +74,10 @@ class SituationalAwarenessTable {
 
   // Prune, re-fuse, merge duplicates, validate verifier slots, update status.
   void refresh(TimeMs now) noexcept;
+
+  // Forget everything `observer` reported and any slot it holds (revoked drone).
+  // Events left with no readings are dropped at the next refresh().
+  std::size_t purgeObserver(DroneId observer) noexcept;
 
   [[nodiscard]] ClaimResult applyClaim(EventId event, DroneId claimant, std::uint8_t role, float score,
                          TimeMs now) noexcept;

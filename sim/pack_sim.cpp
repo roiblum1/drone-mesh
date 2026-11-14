@@ -20,6 +20,7 @@
 #include <memory>
 #include <vector>
 
+#include "amc8270/mesh/crypto.hpp"
 #include "amc8270/mesh/geo.hpp"
 #include "amc8270/mesh/pack_mesh_manager.hpp"
 
@@ -410,7 +411,11 @@ int main() {
     d->node.idx = static_cast<int>(i);
     d->gmcs.drone = d->id;
     d->guidance.owner = d.get();
-    d->mgr = std::make_unique<PackMeshManager>(static_cast<DroneId>(d->id), cfg, g_clock, d->node, d->gmcs, d->guidance);
+    d->mgr = std::make_unique<PackMeshManager>(static_cast<DroneId>(d->id), cfg, 1U, g_clock, d->node, d->gmcs, d->guidance);
+    // Mission data load: one key epoch for the sortie. (Simulation key, not a real one.)
+    crypto::Key mission_key{};
+    for (std::size_t k = 0; k < mission_key.size(); ++k) mission_key[k] = static_cast<std::uint8_t>(0xA5U ^ (k * 29U));
+    if (!d->mgr->installEpochKey(1, mission_key, 0, kNoExpiry)) return 1;
     d->mgr->addKnownBenignSignature(kSigKnown);  // pre-briefed in the mission data load
     net.drones.push_back(d.get());
     drones.push_back(std::move(d));

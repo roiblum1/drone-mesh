@@ -45,7 +45,9 @@ CMake works too: `cmake -S . -B build-cmake && cmake --build build-cmake && ctes
 | `types.hpp`, `config.hpp` | Ids, enums, capacities (`kMaxPackSize = 16`, `kMaxEvents = 64`, ...) and the tunable `MeshConfig` |
 | `drone_state.hpp` | `DroneState`: position, remaining endurance (of the 7-hour combustion EMU's nominal), active device on the Variable Homing Devices bus, mode `PACK_ROUTING` / `ACTIVE_MISSION` (plus `VERIFYING`, `RTB`) |
 | `detected_event.hpp` | `SensorObservation`, `DetectedEvent`, `VerificationTask` |
-| `mesh_packet.hpp/.cpp` | `MeshPacket` and its wire format: little-endian, CRC-32, strict validation on decode |
+| `mesh_packet.hpp/.cpp` | `MeshPacket`, the plaintext body codec (little-endian, strict validation on decode) and the v2 frame header |
+| `mesh_security.hpp/.cpp` | `MeshSecurity`: seals and opens frames; key epochs, per-drone keys, replay windows, freshness, revocation |
+| `crypto.hpp/.cpp` | ChaCha20-Poly1305 (RFC 8439), constant-time tag check, key zeroization |
 | `geo.hpp/.cpp` | Distance and bearing, local east/north frame, bearing-only triangulation |
 | `situational_awareness.hpp/.cpp` | `SituationalAwarenessTable`: peers, fused events, verifier slots, and the common learning of the situation (benign signatures) |
 | `coordination.hpp/.cpp` | Mission task prioritisation: urgency, suitability, verifier selection, alert levels and alert-owner ranking (pure functions) |
@@ -68,7 +70,27 @@ CMake works too: `cmake -S . -B build-cmake && cmake --build build-cmake && ctes
 - Explicit little-endian serialisation; no struct copies onto the wire.
 - `make audit` fails the build if the library uses `new`, `malloc`, `throw`, `dynamic_cast`, `std::vector`, `std::string` and similar.
 
-One `PackMeshManager` is about 60 KB of fixed storage.
+One `PackMeshManager` is about 63 KB of fixed storage.
+
+### Mesh security
+
+Every frame is sealed with ChaCha20-Poly1305. Nothing is sent or accepted until a key epoch is installed.
+
+```
+ 0      2    3     4     6       8         12      16     18             18+len   +16
+ |magic |ver |flags|src  |epoch  |session  |seq    |len   |ciphertext    |tag     |
+ |0x8270|2   |0    |u16  |u16    |u32      |u32    |u16   |type,time,body|16 B    |
+  \_____________ clear, authenticated as AAD ____________/
+```
+
+- **Key epochs.** The GMCS issues one 256-bit key per epoch, in the mission data load or as a re-key over a C2 link (`installEpochKey`). An epoch has a send window and is still accepted 10 s either side of it, so frames in flight across a re-key survive. Up to four epochs are held at once; `zeroizeKeys()` erases them all.
+- **Per-drone keys.** A drone seals with its own key, derived from the epoch key and its id. The id and epoch are in the authenticated header, so a frame verifies only under the key of the drone it names; relabelling a frame as another drone's breaks it.
+- **Nonces.** The nonce is (boot session, sequence number, sender, epoch). The boot session is a non-volatile counter that must grow on every boot, so a reboot never reuses a nonce.
+- **Replay.** Per sender, a 64-frame sliding window over (session, seq) accepts each frame once, even out of order, and frames from an older boot session are refused. An authentic frame sent more than 5 s ago, or stamped more than 2 s in the future, is refused as stale, which bounds replay to a drone that has no window state yet.
+- **Revocation.** `revokeDrone(id)` refuses the drone's frames at once, drops it from the pack and forgets its readings. Issuing the next epoch key to every drone but that one completes the exclusion.
+- **Authentication first.** The tag is checked before anything is decrypted or parsed. Authentic frames still pass every content check (ranges, NaN, sender is the named observer or claimant), because a key holder can seal anything.
+
+Each reason a frame is refused is counted separately in `MeshStats` (`rx_auth_failed`, `rx_no_key`, `rx_replayed`, `rx_stale`, `rx_revoked`, `rx_rejected`).
 
 ## What was verified
 
@@ -81,14 +103,16 @@ One `PackMeshManager` is about 60 KB of fixed storage.
 
 These are the open items you should know about before relying on any of this:
 
-- **No authentication or encryption.** Packets carry a CRC, which catches accidents, not an attacker. A real mesh needs authenticated encryption, key management and replay protection.
+- **The cipher is not a validated module.** ChaCha20-Poly1305 is implemented from RFC 8439 and checked against the RFC's vectors and against OpenSSL on 858 random cases, but it has not been through a crypto-module validation or a side-channel review on the target. For anything that flies, put a validated module behind `crypto.hpp`; nothing else depends on how it is implemented.
+- **Insiders can forge within an epoch.** Keys are symmetric, so every pack member holds the epoch key. A drone captured with its key store intact can forge frames in any member's name until the next epoch. Revocation drops its own identity at once; re-keying without it ends the rest. Only per-sender signatures would stop an insider sooner.
+- **The boot session must persist.** It has to come from a non-volatile counter that increases on every boot. If it repeats, nonces repeat and the mesh loses secrecy and integrity. Key fill, key storage and the C2 re-key message are outside this repo.
 - **No flight validation.** All performance numbers come from a software simulation with idealised sensors and radio.
 - **The Model 8270's real interfaces are assumed.** Everything touches hardware through `hal.hpp`; the bus choices in deliverable 3 are recommendations, not an ICD.
 - **The FCS interface has no reply.** A real one needs accept / refuse.
 - **Time assumes a shared GNSS-disciplined clock.** GNSS-denied operation is not handled.
 - **The corridor is a circle.** A real approved corridor is a polygon.
 - **Mesh partitions** are handled by design (each side keeps working, the GMCS de-duplicates) but not tested.
-- **Forged packets.** Without authentication a sender can still lie about itself: a forged `SIGNATURE_UPDATE` dismisses that frequency pack-wide and permanently, and a forged `ALERT_ISSUED` suppresses an alert. The code now rejects packets whose observer, claimant or issuer is not the sender, implausible values, out-of-range claim scores and future timestamps, but only authenticated encryption closes this.
+- **A pack member can still lie in its own name.** Authentication proves which drone sent a frame, not that its content is true. A drone that holds a valid key can report false readings or send a `SIGNATURE_UPDATE` that dismisses a frequency pack-wide. Content checks limit the damage (ranges, a drone speaks only for itself); revocation removes the drone.
 - **Association depends on arrival order in one corner case.** Three sources closer together than the association gate (500 m plus 1.5 x CEP) can be grouped differently depending on which reading arrives first, and the grouping is not revisited. A deterministic re-clustering in `refresh()` would fix it.
 - **Bearing-only readings with no signature are never triangulated.** Readings are linked by frequency until a position exists. Every RF direction-finder reports a frequency, so this only matters for a sensor that does not.
 - **Plans assume nearly synchronous state.** Each drone plans from its own fresh state, its peers' last heartbeats (up to 1 s old) and its own clock. Claims and the incumbent bonus absorb the small differences; large clock disagreement is not handled.

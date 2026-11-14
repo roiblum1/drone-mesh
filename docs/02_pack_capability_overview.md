@@ -154,16 +154,16 @@ The five-minute gap between ADVISORY and PRIORITY is flight time: the verifier f
 
 ## 4. Mesh traffic [simulated and measured]
 
-Encoded sizes (header 20 B + payload + 4 B CRC):
+Encoded sizes (18 B clear header + 9 B encrypted type and time + payload + 16 B authentication tag):
 
 | Message | Size | When |
 |---|---|---|
-| HEARTBEAT (position, fuel, sensor, mode, task) | 70 B | 1 Hz, and immediately on a mode/task change |
-| OBSERVATION | 85 B | On each reading, then every 2 s while it is current |
-| TASK_CLAIM | 35 B | On a task change, then every 4 s |
-| ALERT_ISSUED | 31 B | Once per alert |
-| SIGNATURE_UPDATE | 28 B | On dismissal, then every 2 s |
-| LEAVE | 24 B | On shutdown |
+| HEARTBEAT (position, fuel, sensor, mode, task) | 89 B | 1 Hz, and immediately on a mode/task change |
+| OBSERVATION | 104 B | On each reading, then every 2 s while it is current |
+| TASK_CLAIM | 54 B | On a task change, then every 4 s |
+| ALERT_ISSUED | 50 B | Once per alert |
+| SIGNATURE_UPDATE | 47 B | On dismissal, then every 2 s |
+| LEAVE | 43 B | On shutdown |
 
 In the scenario: **1.69 kbit/s mean and 3.69 kbit/s peak transmitted per drone**, including 5 % simulated loss. Every transmission is a broadcast, so a shared channel carries the sum: 6 × 1.69 ≈ 10 kbit/s mean and 6 × 3.69 ≈ 22 kbit/s peak [computed], about 1 % and 2 % of a modest 1 Mbit/s mesh radio. Load grows roughly linearly with pack size. By comparison a single compressed EO/IR video stream is of the order of megabits per second [estimate], which is why the system shares detections and not video.
 
@@ -175,7 +175,7 @@ Memory: one `PackMeshManager` is about 60 KB of fixed storage, allocated once. N
 
 | Situation | What the design does | Verified? |
 |---|---|---|
-| Corrupt or malformed packet | CRC-32, framing, enum and range checks; NaN or out-of-range values rejected and counted | Yes: corrupting any one byte of a test packet, any truncation, NaN and out-of-range fields are all rejected |
+| Corrupt or malformed frame | Poly1305 tag checked before anything is parsed; then framing, enum and range checks; NaN or out-of-range values rejected and counted | Yes: corrupting any one byte of a frame, any truncation, NaN and out-of-range fields are all rejected |
 | Packet loss | Sequence gaps estimate link quality; own readings re-sent every 2 s | Yes: 30 % loss converges in 25 s |
 | Peer lost | Dropped after 5 s; its verification slot freed and re-assigned | Yes, unit test and scenario |
 | Drone leaves the mesh deliberately | `LEAVE` removes it at once | Yes |
@@ -184,12 +184,17 @@ Memory: one `PackMeshManager` is about 60 KB of fixed storage, allocated once. N
 | Alert owner has no link, or the send fails | Retried each cycle; the next-ranked drone takes over after 3 s | Yes |
 | Mesh partition | Each side keeps working from its own table; both sides may alert for the same event; the GMCS de-duplicates by event id | By design; not tested |
 | Two sources on the same frequency | Fused only if their positions or bearings agree; a shared frequency alone is not enough | Yes |
-| Packet naming another drone as its source, future timestamp, absurd values | Rejected on receipt and counted | Yes |
+| Packet naming another drone as its source, future timestamp, absurd values | Rejected on receipt and counted, even when sealed by a key holder | Yes |
+| Forged frame from outside the pack | Fails authentication (ChaCha20-Poly1305, per-drone keys); counted in `rx_auth_failed` | Yes: an outsider's frames, dismissals and alert notices change nothing |
+| Recorded frames replayed later | Refused by the per-sender replay window, or as stale after 5 s | Yes |
+| Drone captured or compromised | The GMCS revokes it (its frames are refused and its readings forgotten), then re-keys without it | Revocation yes; re-key distribution is outside this repo |
+| Drone reboots | New boot session: its frames are accepted at once, and frames from its old session are refused | Yes |
 | Clock stepped backwards (GNSS correction) | Periodic messages keep flowing | Yes |
 | Same source filed under two ids | Merged into the lowest id; old id kept as an alias | Yes |
 | Table full | Lowest-urgency event without a verifier is evicted | Yes |
 | FCS refuses a task | Not modelled: the request interface returns nothing; a real interface needs an accept/reject reply | Open |
-| **Message authentication and encryption** | **Not implemented.** A CRC detects accidents, not an attacker. The packet format has no key or MAC field yet | **Open: required before any real use** |
+| **Insider forgery within an epoch** | Symmetric keys: any member can forge another's frames until the next epoch. Needs per-sender signatures to close | **Open** |
+| **Validated crypto module** | ChaCha20-Poly1305 is implemented from RFC 8439 and vector-tested, not validated | **Open: required before any real use** |
 | **GNSS-denied time** | Timestamps assume a PPS-disciplined clock shared by the pack; if it drifts, observation ageing and ordering degrade | **Open** |
 
 ## 6. What this does not do
@@ -201,7 +206,7 @@ Memory: one `PackMeshManager` is about 60 KB of fixed storage, allocated once. N
 ## 7. Decisions needed from the programme
 
 1. Mesh radio type, capacity and range, to replace the sim's 60 km / 5 % loss assumption.
-2. Authentication, encryption and key management for the mesh, and replay protection.
+2. Key management for the mesh: who generates epoch keys, how they are filled and stored on the aircraft, how the GMCS re-keys over C2, and whether per-sender signatures are needed against a captured drone.
 3. The GMCS alert message format and the operator's dismissal workflow.
 4. The FCS's accept/reject reply and the shape of the approved corridor (polygon rather than circle).
 5. Whether `ACTIVE_MISSION` drones should share raw readings (assumed yes) or only alerts.
